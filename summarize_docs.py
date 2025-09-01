@@ -1,25 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-summarize_docs.py (Ollama 專用 / 強化版)
----------------------------------------
+summarize_docs.py (Ollama 專用 / 不分段版)
+-----------------------------------------
 讀取 parsed/<category>.jsonl（每行一份：subject/body/meta/filename/category），
 呼叫本地 Ollama 指令模型產出「嚴格 JSON 的結構化摘要」，
 並做後處理（姓名/身分證/保單號/insurer/動作詞補強、doc_no 回填）。
 
-輸出 summaries/<category>.jsonl（每行一筆嚴格 JSON）。
-
-用法：
-  # 先確認 ollama 服務與模型：
+▶ 用法例子：
+  # 先確認 ollama 與模型：
   #   ollama serve
-  #   ollama pull qwen2.5:1.5b-instruct   (建議先用小模型驗通道)
+  #   ollama pull qwen2.5:3b-instruct   (建議先用 3b 或 1.5b 驗通道)
   #
-  # 小量測試（只跑 1 筆）
-  #   python summarize_docs.py --model qwen2.5:1.5b-instruct --limit 1
+  # 小量測試（只跑 1 筆，頭尾截斷，上下文 8192）：
+  #   python summarize_docs.py --model qwen2.5:3b-instruct --limit 1 --truncate-mode headtail --num-ctx 8192
   #
-  # 指定類別
-  #   python summarize_docs.py --model qwen2.5:3b-instruct --categories 保單查詢 --limit 3
-  #
-  # 預設 input-dir=parsed, output-dir=summaries
+  # 指定類別跑幾筆：
+  #   python summarize_docs.py --model qwen2.5:3b-instruct --categories 保單查詢 --limit 3 --truncate-mode headtail --num-ctx 8192
 """
 
 import argparse
@@ -28,7 +24,7 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from urllib import request, error
+from urllib import request
 
 # =========================
 # 基本設定
@@ -36,12 +32,12 @@ from urllib import request, error
 
 BACKEND_CONFIG = {
     "backend": "ollama",                 # 僅支援 ollama
-    "model": "qwen2.5:1.5b-instruct",    # 預設用小模型先跑通；可在 CLI 更改
+    "model": "qwen2.5:3b-instruct",      # 預設先用 3b；可在 CLI 覆蓋
     "temperature": 0.0,
     "base_url": "http://127.0.0.1:11434",
 }
 
-# 長文截斷（避免本地小模型卡住）；可用 --max-chars 覆蓋
+# 長文截斷上限（避免本地小模型卡住）；可用 --max-chars 覆蓋
 MAX_CHARS_DEFAULT = 3000
 
 # 正則：台灣 ID / 保單號（簡化啟發式）/ 中文姓名
@@ -58,8 +54,14 @@ KNOWN_INSURERS = [
     "友邦人壽", "遠雄人壽", "宏泰人壽", "安聯人壽", "法國巴黎人壽", "保德信人壽"
 ]
 
-# System 與 User Prompt（要求只輸出 JSON）
-SYSTEM_PROMPT = "你是一個嚴格的資訊抽取器。你只輸出 JSON（嚴格符合我提供的 schema），不可輸出其它任何文字、註解或Markdown圍欄。對於不確定的欄位，請輸出 null 或空陣列，不要猜測。"
+# =========================
+# Prompt：System / Schema / User
+# =========================
+
+SYSTEM_PROMPT = (
+    "你是一個嚴格的資訊抽取器。你只輸出 JSON（嚴格符合我提供的 schema），"
+    "不可輸出其它任何文字、註解或Markdown圍欄。對於不確定的欄位，請輸出 null 或空陣列，不要猜測。"
+)
 
 # ---- 供模板注入的 Schema（純文字，無註解）----
 SCHEMA_JSON = r'''{
@@ -147,7 +149,7 @@ USER_PROMPT_TEMPLATE = """請依下列【輸出規格】與【規則】從公文
 """
 
 # =========================
-# 工具：HTTP 與 JSON 容錯
+# 工具：HTTP、JSON 容錯、截斷策略
 # =========================
 
 def http_post_json(url: str, payload: Dict[str, Any], timeout: int = 600) -> Dict[str, Any]:
@@ -216,15 +218,34 @@ def safe_json_loads_loose(s: str) -> dict:
     candidate = s[first:end_idx+1].strip()
     return json.loads(candidate)
 
+def truncate_text(text: str, max_chars: int, mode: str = "headtail") -> str:
+    """長文截斷策略：head=只留開頭；headtail=保留頭尾"""
+    if not text or len(text) <= max_chars:
+        return text
+    if mode == "head":
+        return text[:max_chars] + f"\n…(已截斷，原長 {len(text)} 字)…"
+    # headtail：前半 + 後半
+    head = max_chars // 2
+    tail = max_chars - head
+    return (
+        text[:head]
+        + f"\n…(中略，原長 {len(text)} 字，已截斷)…\n"
+        + text[-tail:]
+    )
+
 # =========================
 # Ollama 後端
 # =========================
 
-def call_llm_ollama(model: str, system: str, user: str, temperature: float = 0.0) -> str:
+def call_llm_ollama(model: str, system: str, user: str, temperature: float = 0.0, num_ctx: Optional[int] = None) -> str:
     url = f"{BACKEND_CONFIG['base_url']}/api/chat"
+    options: Dict[str, Any] = {"temperature": temperature}
+    if num_ctx:
+        options["num_ctx"] = num_ctx  # 例如 8192/16384（模型需支援）
+
     payload = {
         "model": model,
-        "options": {"temperature": temperature},
+        "options": options,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -363,9 +384,10 @@ def build_user_prompt(category: str, subject: str, body: str) -> str:
         body=body or ""
     )
 
-def call_llm(category: str, subject: str, body: str, max_chars: int) -> Dict[str, Any]:
+def call_llm(category: str, subject: str, body: str, max_chars: int,
+             truncate_mode: str = "headtail", num_ctx: Optional[int] = None) -> Dict[str, Any]:
     if body and len(body) > max_chars:
-        body = body[:max_chars] + "\n…(截斷)…"
+        body = truncate_text(body, max_chars, mode=truncate_mode)
 
     user_prompt = build_user_prompt(category, subject, body)
     raw = call_llm_ollama(
@@ -373,6 +395,7 @@ def call_llm(category: str, subject: str, body: str, max_chars: int) -> Dict[str
         system=SYSTEM_PROMPT,
         user=user_prompt,
         temperature=BACKEND_CONFIG["temperature"],
+        num_ctx=num_ctx,
     )
     try:
         data = safe_json_loads_loose(raw)
@@ -381,7 +404,12 @@ def call_llm(category: str, subject: str, body: str, max_chars: int) -> Dict[str
         raise ValueError(f"LLM 回傳非純 JSON：{e}; 片段預覽={preview}")
     return data
 
-def process_all(input_dir: Path, output_dir: Path, only_categories: Optional[List[str]] = None, limit: Optional[int] = None, max_chars: int = MAX_CHARS_DEFAULT):
+def process_all(input_dir: Path, output_dir: Path,
+                only_categories: Optional[List[str]] = None,
+                limit: Optional[int] = None,
+                max_chars: int = MAX_CHARS_DEFAULT,
+                truncate_mode: str = "headtail",
+                num_ctx: Optional[int] = None) -> None:
     output_dir.mkdir(exist_ok=True, parents=True)
     files = sorted(input_dir.glob("*.jsonl"))
 
@@ -412,7 +440,12 @@ def process_all(input_dir: Path, output_dir: Path, only_categories: Optional[Lis
                 try:
                     subject = rec.get("subject", "") or ""
                     body = rec.get("body", "") or ""
-                    llm_json = call_llm(category, subject, body, max_chars=max_chars)
+                    llm_json = call_llm(
+                        category, subject, body,
+                        max_chars=max_chars,
+                        truncate_mode=truncate_mode,
+                        num_ctx=num_ctx,
+                    )
                     final_json = validate_and_enhance(llm_json, category, subject, body)
 
                     # 附加來源資訊
@@ -436,18 +469,30 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="以本地 Ollama 對公文做結構化摘要（姓名/身分證/保單資訊）")
     p.add_argument("--input-dir", type=str, default="parsed", help="輸入目錄（extract_body.py 的輸出）")
     p.add_argument("--output-dir", type=str, default="summaries", help="輸出目錄（每類別一個 .jsonl）")
-    p.add_argument("--model", type=str, default=BACKEND_CONFIG["model"], help="Ollama 模型名稱，如 qwen2.5:1.5b-instruct")
+    p.add_argument("--model", type=str, default=BACKEND_CONFIG["model"], help="Ollama 模型名稱，如 qwen2.5:3b-instruct")
     p.add_argument("--categories", nargs="*", default=None, help="只處理指定類別（檔名 stem），如：保單查詢 通知函")
     p.add_argument("--limit", type=int, default=None, help="每檔前 N 筆測試用")
-    p.add_argument("--max-chars", type=int, default=MAX_CHARS_DEFAULT, help="正文最大字元數（超過會截斷以加速）")
+    p.add_argument("--max-chars", type=int, default=MAX_CHARS_DEFAULT, help="正文最大字元數（超過會截斷）")
+    p.add_argument("--truncate-mode", choices=["head", "headtail"], default="headtail",
+                   help="截斷策略：head=只留開頭、headtail=保留頭尾（預設）")
+    p.add_argument("--num-ctx", type=int, default=None,
+                   help="Ollama context tokens（如 8192/16384，需模型支援）")
     return p.parse_args()
 
 def main():
     args = parse_args()
     BACKEND_CONFIG["model"] = args.model
 
-    print(f"🚀 backend=ollama  model={args.model}  max_chars={args.max_chars}")
-    process_all(Path(args.input_dir), Path(args.output_dir), args.categories, args.limit, max_chars=args.max_chars)
+    print(f"🚀 backend=ollama  model={args.model}  max_chars={args.max_chars}  truncate_mode={args.truncate_mode}  num_ctx={args.num_ctx}")
+    process_all(
+        Path(args.input_dir),
+        Path(args.output_dir),
+        args.categories,
+        args.limit,
+        max_chars=args.max_chars,
+        truncate_mode=args.truncate_mode,
+        num_ctx=args.num_ctx,
+    )
     print("🎉 完成")
 
 if __name__ == "__main__":
