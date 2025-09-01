@@ -55,38 +55,60 @@ SYSTEM_PROMPT = "你是一個嚴格的資訊抽取器。你只輸出 JSON，絕�
 
 USER_PROMPT_TEMPLATE = """請根據以下公文內容，產生結構化摘要（JSON 格式、UTF-8、strict JSON）。
 
-【任務要求】
-1. 目的：萃取關鍵欄位，若沒有就填 null。
-2. 僅輸出 JSON，不要文字解釋、不要加 ```json。
-3. 欄位說明：
-   - category: 原始類別（如：保單查詢/通知函/扣押命令…）
-   - title: 10~40 字內中文摘要標題
-   - summary: 100~200 字內要點摘要（誰／對誰／做什麼／何時／要求）
-   - persons: 涉及之人名列表（中文名為主）
-   - ids: 可能的身分證字號列表（格式：1 英文 + 9 數字）
-   - policy_type: 保單種類（壽險/意外險/醫療險/傷害險/火險；若不明填 null）
-   - policy_numbers: 保單或契約編號列表（英數 8–20）
-   - actions: 本文涉及之動作/要求（如：查詢、撤銷、扣押、通知、補件）
-   - date_mentions: 文中重要日期（yyyy-mm-dd 或民國紀年原樣）
-   - parties: 涉及機關/公司/單位名列表
-   - extra: 其他關鍵欄位（字典），如案件號、法院字號、金額、地址、電話等
+請依下列【輸出規格】與【規則】從公文文本萃取資訊，僅輸出一個 JSON 物件。
 
-【輸出 JSON 範例】
+【輸出規格(JSON schema)】
+{SCHEMA_JSON}
+
+【規則（務必遵守）】
+1) 僅輸出 JSON，不得含有多餘文字或註解。
+2) persons：只放「純姓名」，不可出現「債務人/承辦人/被告/申請人」等角色詞。
+   - 若文本為「債務人王小明」，persons.name 只寫「王小明」。
+   - 若找不到對應身分證，id_number=null；若找到，必須與該姓名配對。
+   - 字母+9數字（如 A123456789）才算身分證；錯一碼就不要填。
+3) policy_numbers：只放保單/契約編號（英數8–20字元），排除法院文號/一般代碼。
+4) insurer：填保險公司官方名稱（如：全球人壽、台灣人壽），若無則 null。
+5) summary：60–160字，說明此公文「最主要用意」與「要求對象/動作」。
+6) actions：從文中抽取（查詢/撤銷/扣押/通知/補件/更正/函覆/檢送/轉知/執行/調查），沒有就空陣列。
+7) 不確定時寧可設為 null 或空陣列，不要猜。
+
+【範例1（示意）】
+<subject>關於查詢債務人保單資料</subject>
+<body>本院通知：請全球人壽提供王小明（身分證A123456789）名下壽險保單PL20250101之相關資料，以利執行。</body>
+
+對應輸出：
 {{
   "category": "{category}",
-  "title": "…",
-  "summary": "…",
-  "persons": ["…"],
-  "ids": ["…"],
+  "title": "法院請求提供王小明之壽險保單資料",
+  "summary": "本院通知全球人壽，請提供王小明名下壽險保單PL20250101之資料，以配合法院執行作業。",
+  "persons": [{{"name": "王小明", "id_number": "A123456789"}}],
+  "policy_numbers": ["PL20250101"],
   "policy_type": "壽險",
-  "policy_numbers": ["…"],
-  "actions": ["查詢"],
-  "date_mentions": ["民國114年01月01日"],
-  "parties": ["臺灣臺北地方法院", "全球人壽"],
-  "extra": {{"doc_no": "北院執智字第123號"}}
+  "insurer": "全球人壽",
+  "actions": ["查詢", "通知"],
+  "date_mentions": [],
+  "extra": {{"doc_no": null, "court": "本院", "insured_name": "王小明", "policy_holder": null}}
 }}
 
-【文本】
+【範例2（示意）】
+<subject>函請提供契約編號 QX998877</subject>
+<body>茲依申請程序，請 貴公司提供要保人李小美名下之契約QX998877資料。未載明身分證。</body>
+
+對應輸出：
+{{
+  "category": "{category}",
+  "title": "請提供李小美名下契約資料",
+  "summary": "函請保險公司提供要保人李小美女士名下契約QX998877之資料，俾便案件審查。",
+  "persons": [{{"name": "李小美", "id_number": null}}],
+  "policy_numbers": ["QX998877"],
+  "policy_type": null,
+  "insurer": null,
+  "actions": ["查詢"],
+  "date_mentions": [],
+  "extra": {{"doc_no": null, "court": null, "insured_name": null, "policy_holder": "李小美"}}
+}}
+
+【待處理文本】
 <subject>
 {subject}
 </subject>
@@ -206,62 +228,85 @@ def _unique_keep(seq: List[str]) -> List[str]:
             out.append(s)
     return out
 
-def validate_and_enhance(record: Dict[str, Any], category: str, subject: str, body: str) -> Dict[str, Any]:
-    out = dict(record)
+ROLE_STOPWORDS = {"債務人", "承辦", "承辦人", "被告", "申請人", "通知", "主旨", "說明", "附件", "本院", "本局", "本公司"}
 
-    # persons：若空，用啟發式補中文姓名候選
+def validate_and_enhance(record, category, subject, body):
+    out = dict(record)
+    s = f"{subject}\n{body}"
+
+    # persons：期望為 [{"name":..., "id_number":...}]
     persons = out.get("persons")
     if not isinstance(persons, list):
         persons = []
-    candidates = CNAME_RE.findall(subject + "\n" + body)
-    stop = {"附件", "說明", "主旨", "通知", "本院", "本局", "本公司", "承辦", "承辦人", "復文"}
-    candidates = [c for c in candidates if c not in stop]
-    out["persons"] = _unique_keep(list(persons) + candidates[:5])
+    # 先把 LLM 給的資料清洗：去掉空白與非法型別
+    clean = []
+    for p in persons:
+        if isinstance(p, dict):
+            name = str(p.get("name", "")).strip()
+            idn  = p.get("id_number", None)
+            if name and name not in ROLE_STOPWORDS:
+                # 身分證正則校驗
+                if isinstance(idn, str) and not TW_ID_RE.fullmatch(idn.strip()):
+                    idn = None
+                clean.append({"name": name, "id_number": idn})
+    persons = clean
 
-    # ids：正則補
+    # 用啟發式補姓名候選（無配對就 id_number=null）
+    cand_names = [c for c in CNAME_RE.findall(s) if c not in ROLE_STOPWORDS]
+    # 去除已存在的姓名
+    existing = {p["name"] for p in persons}
+    for n in cand_names:
+        if n not in existing and len(persons) < 5:  # 控制最多補 5 個
+            persons.append({"name": n, "id_number": None})
+            existing.add(n)
+    out["persons"] = persons
+
+    # ids 與 policy_numbers：維持既有欄位，但我們優先信任 LLM；正則只做補充
     ids = out.get("ids")
     if not isinstance(ids, list):
         ids = []
-    out["ids"] = _unique_keep(list(ids) + TW_ID_RE.findall(subject + "\n" + body))
+    ids = _unique_keep(list(ids) + TW_ID_RE.findall(s))
+    out["ids"] = ids
 
-    # policy_numbers：正則補
     pols = out.get("policy_numbers")
     if not isinstance(pols, list):
         pols = []
-    out["policy_numbers"] = _unique_keep(list(pols) + POLICY_RE.findall(subject + "\n" + body))
+    pols = _unique_keep(list(pols) + POLICY_RE.findall(s))
+    out["policy_numbers"] = pols
 
-    # policy_type：缺時用關鍵詞補
+    # policy_type：關鍵詞補
     if not out.get("policy_type"):
-        s = subject + "\n" + body
-        if "壽險" in s:
-            out["policy_type"] = "壽險"
-        elif "意外險" in s:
-            out["policy_type"] = "意外險"
-        elif "醫療險" in s or "醫療保險" in s:
-            out["policy_type"] = "醫療險"
-        elif "傷害險" in s:
-            out["policy_type"] = "傷害險"
-        elif "火險" in s:
-            out["policy_type"] = "火險"
-        else:
-            out["policy_type"] = None
+        if "壽險" in s: out["policy_type"] = "壽險"
+        elif "意外險" in s: out["policy_type"] = "意外險"
+        elif "醫療險" in s or "醫療保險" in s: out["policy_type"] = "醫療險"
+        elif "傷害險" in s: out["policy_type"] = "傷害險"
+        elif "火險" in s: out["policy_type"] = "火險"
+        else: out["policy_type"] = None
 
-    # actions：缺時用關鍵詞補
+    # actions：關鍵詞補
     if not out.get("actions"):
-        s = subject + "\n" + body
         actions = []
-        for k in ["查詢", "撤銷", "扣押", "通知", "補件", "更正", "函覆", "檢送", "轉知", "拍賣", "執行", "調查"]:
-            if k in s:
-                actions.append(k)
-        out["actions"] = _unique_keep(actions) or None
+        for k in ["查詢","撤銷","扣押","通知","補件","更正","函覆","檢送","轉知","執行","調查"]:
+            if k in s: actions.append(k)
+        out["actions"] = _unique_keep(actions) or []
 
-    # extra：確保字典
+    # insurer：若模型沒給，試簡單抽公司名
+    if not out.get("insurer"):
+        for kw in ["全球人壽","台灣人壽","國泰人壽","新光人壽","富邦人壽","南山人壽"]:
+            if kw in s:
+                out["insurer"] = kw
+                break
+        else:
+            out["insurer"] = None
+
+    # extra：確保字典，回填 doc_no
     if not isinstance(out.get("extra"), dict):
         out["extra"] = {}
+    # 回填來源 doc_no（extract_body 產出的 meta.doc_no）
+    # 此步驟保留在主流程中已有，你可保留或移到這裡
 
-    # category 覆寫為來源（避免模型亂改）
+    # category 覆寫
     out["category"] = category
-
     return out
 
 # =========================
