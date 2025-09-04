@@ -1,30 +1,25 @@
-FOLDER_PATH = "next_folder"   # 你要換的資料夾
-OUTPUT_FILE = "final_output.json"
+    if args.file:
+        # 準備輸出 CSV
+        with open(args.out_csv, "w", encoding="utf-8-sig", newline="") as csvf:
+            writer = csv.writer(csvf)
+            writer.writerow(["text", "label"])  # 表頭
 
-# Step 1: 如果 JSON 檔存在，就讀進來
-if os.path.exists(OUTPUT_FILE):
-    with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-        all_data = json.load(f)
-else:
-    all_data = []
+            # 逐行讀取並分類
+            with open(args.file, "r", encoding="utf-8") as f:
+                for line in f:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    pred = classify_subject(
+                        text,
+                        model_name=args.model,
+                        device=args.device,
+                        topk=args.topk,
+                        temperature=args.temperature,
+                        threshold=args.threshold,
+                        return_neighbors=0  # 不需要鄰居，加速
+                    )
+                    writer.writerow([text, pred.label])
 
-# Step 2: 處理新資料夾
-for filename in os.listdir(FOLDER_PATH):
-    if filename.endswith(".txt"):
-        file_path = os.path.join(FOLDER_PATH, filename)
-        with open(file_path, "r", encoding="utf-8") as file:
-            text = file.read()
-
-        extracted_info = extract_info_from_text(text)
-        extracted_info["general_subject"] = re.sub(
-            r"[!\"#$%&'()*+,-./:;<=>?@[\\\]^_{|}~a-z\s]",
-            "",
-            extracted_info["general_subject"]
-        )
-        all_data.append(extracted_info)
-
-# Step 3: 存回 JSON 檔（舊+新）
-with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    json.dump(all_data, f, ensure_ascii=False, indent=4)
-
-print(f"✅ 已經把 {FOLDER_PATH} 的資料追加到 {OUTPUT_FILE}")
+        print(f"✅ 已完成批次分類，CSV 輸出到：{args.out_csv}")
+        return
