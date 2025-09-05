@@ -1,515 +1,248 @@
-# -*- coding: utf-8 -*-
-"""
-summarize_docs.py (Ollama 專用 / 說明段落加強版)
-------------------------------------------------
-讀取 parsed/<category>.jsonl（每行一份：subject/body/meta/filename/category），
-自動擷取「說明」段落，呼叫本地 Ollama 產生嚴格 JSON 的結構化摘要（公務員視角），
-並做後處理（姓名/身分證/保單號/insurer/動作詞/期限補強、doc_no 回填）。
-
-輸出 summaries/<category>.jsonl（每行一筆嚴格 JSON）。
-
-用法：
-  # 先確認 ollama 與模型（建議 3B 起步）：
-  #   ollama serve
-  #   ollama pull qwen2.5:3b-instruct
-  #
-  # 小量測試（1 筆、頭尾截斷、上下文 8192）：
-  #   python summarize_docs.py --model qwen2.5:3b-instruct --limit 1 --truncate-mode headtail --num-ctx 8192
-  #
-  # 指定類別跑幾筆：
-  #   python summarize_docs.py --model qwen2.5:3b-instruct --categories 保單查詢 --limit 5
-"""
-
-import argparse
-import json
+# summarize_docs.py
 import re
-import time
+import json
+import argparse
+import datetime as dt
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-from urllib import request
+from typing import Dict, List, Tuple, Optional
+import pandas as pd
 
-# =========================
-# 基本設定
-# =========================
-
-BACKEND_CONFIG = {
-    "backend": "ollama",
-    "model": "qwen2.5:3b-instruct",   # 可用 CLI 覆蓋
-    "temperature": 0.0,
-    "base_url": "http://127.0.0.1:11434",
+# ---- 角色詞、動作詞、急件詞 ----
+ROLE_TOKENS = ["要保人","被保險人","受益人","債務人","債權人","公職人員","被查詢人","相對人"]
+URGENT_TOKENS = ["急件","急速","速","儘速","即刻","從速","逕行","限期","於","日內","逾期"]
+ACTION_MAP = {
+    "查詢": ["查詢","提供資料","提供保單資料","資料提供","查覆","查復","函覆","復文","函復"],
+    "註記": ["註記","維持註記","延長註記","警示","限制"],
+    "收取": ["收取","代收","逕收","就地收取","先行收取"],
+    "撤銷": ["撤銷","撤回","撤銷前令","撤銷命令"],
+    "扣押": ["扣押","支付轉給命令","禁止給付","凍結","強制執行","執行命令"],
+    "通知": ["通知","轉知","知會","請查照","如說明辦理"]
 }
 
-MAX_CHARS_DEFAULT = 3000  # 正文截斷上限（可用 --max-chars 覆蓋）
+# ---- 簡易正則 ----
+RE_SUBJECT = re.compile(r'(?:主旨|主文)\s*[:：]\s*(.+)')
+RE_DESC1   = re.compile(r'(?:說明|理由)\s*[:：]\s*(?:一、|1[\.、])?\s*(.+?)(?:\n|。)', re.S)
+RE_BASIS   = re.compile(r'(?:依據|依)\s*[:：]?\s*(.+?)(?:\n|。|；)')
+RE_AGENCY  = re.compile(r'(?:發文機關|來文單位|機關|法院|執行處)\s*[:：]\s*([^\n\r，。；]+)')
+RE_CASEID  = re.compile(r'((?:北|中|南|高|桃|新)?院[^\s，。:：]*?(?:司執|家執|智|字|年度)[^\s，。]*)')
+RE_POLICY  = re.compile(r'(?:保單(?:號|編號)?)[：:\s]*([A-Za-z0-9\-]{6,})')
+RE_ID      = re.compile(r'\b([A-Z][12]\d{8})\b')   # 台灣身分證
+RE_PHONE   = re.compile(r'(?:電話|聯絡方式)[：:\s]*([0-9\-#轉extEXT]{6,})')
+RE_NAME_BY_ROLE = re.compile(r'(要保人|被保險人|受益人|債務人|債權人|公職人員)[：:\s]*([^\s，、。()（）]{2,4})')
+RE_DATE_SLASH = re.compile(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})')         # 2025/09/05
+RE_DATE_CHT   = re.compile(r'(\d{3,4})年(\d{1,2})月(\d{1,2})日')         # 114年9月5日 或 2025年9月5日
+RE_WITHIN_DAYS = re.compile(r'於\s*(\d{1,3})\s*日內')
 
-# 正則：台灣身分證 / 保單號 / 中文姓名 / 期限
-TW_ID_RE  = re.compile(r"\b[A-Z][0-9]{9}\b")
-POLICY_RE = re.compile(r"\b[A-Z0-9]{8,20}\b", re.IGNORECASE)
-CNAME_RE  = re.compile(r"[\u4e00-\u9fa5·]{2,4}")
+def tw_roc_to_ad(y: int) -> int:
+    # 民國年轉西元
+    return y + 1911 if y < 1911 else y
 
-# 期限（例：請於10日內、最遲於民國113年12月31日前）
-DEADLINE_PATTERNS = [
-    re.compile(r"(?:請於|應於|最遲於|限於)\s*([0-9]{1,2})\s*日內"),
-    re.compile(r"(?:請於|應於|最遲於|限於)\s*(民國[0-9]{2,3}年[0-9]{1,2}月[0-9]{1,2}日)前?"),
-    re.compile(r"(?:請於|應於|最遲於|限於)\s*([0-9]{4}[/-][0-9]{1,2}[/-][0-9]{1,2})前?"),
-    re.compile(r"(?:最遲|期限|限期)為?\s*(民國[0-9]{2,3}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[/-][0-9]{1,2}[/-][0-9]{1,2})")
-]
-
-ROLE_STOPWORDS = {"債務人", "承辦", "承辦人", "被告", "申請人", "通知", "主旨", "說明", "附件", "本院", "本局", "本公司"}
-
-KNOWN_INSURERS = [
-    "全球人壽", "台灣人壽", "臺灣人壽", "國泰人壽", "新光人壽", "富邦人壽", "南山人壽", "中國人壽",
-    "友邦人壽", "遠雄人壽", "宏泰人壽", "安聯人壽", "法國巴黎人壽", "保德信人壽"
-]
-
-# =========================
-# Prompt：System / Schema / User
-# =========================
-
-SYSTEM_PROMPT = (
-    "你是一位公務機關文書承辦視角的資訊抽取器。你只輸出 JSON（嚴格符合我提供的 schema），"
-    "不可輸出其它任何文字、註解或Markdown圍欄。對於不確定的欄位，請輸出 null 或空陣列，不要猜測。"
-)
-
-SCHEMA_JSON = r'''{
-  "category": "string",
-  "title": "string",
-  "summary": "string",
-  "persons": [
-    {"name": "string", "id_number": "string|null"}
-  ],
-  "policy_numbers": ["string"],
-  "policy_type": "string|null",
-  "insurer": "string|null",
-  "actions": ["string"],
-  "date_mentions": ["string"],
-
-  "deadline": "string|null",
-  "rationale_points": ["string"],
-  "required_documents": ["string"],
-  "agent_todo": ["string"],
-
-  "extra": {
-    "doc_no": "string|null",
-    "court": "string|null",
-    "insured_name": "string|null",
-    "policy_holder": "string|null"
-  }
-}'''
-
-USER_PROMPT_TEMPLATE = """請依下列【輸出規格】與【規則】，從公文文本萃取資訊，僅輸出一個 JSON 物件（公務員視角、用詞精確）。
-
-【輸出規格(JSON schema)】
-{SCHEMA_JSON}
-
-【規則（務必遵守）】
-1) 僅輸出 JSON，不得含有多餘文字或註解。
-2) persons：只放「純姓名」，不可出現「債務人/承辦人/被告/申請人」等角色詞。
-   - 若文本為「債務人王小明」，persons.name 只寫「王小明」。
-   - 若找不到對應身分證，id_number=null；若找到，必須與該姓名配對。
-   - 身分證必須符合 1 英文 + 9 數字（例如 A123456789），否則設為 null。
-3) policy_numbers：只放保單/契約編號（英數 8–20 字元），排除法院文號/一般代碼。
-4) insurer：填保險公司官方名稱（如：全球人壽/台灣人壽），若無則 null。
-5) summary：60–160字，以「公文最主要用意」與「要求對象/動作」為核心（公務員視角）。
-6) rationale_points：僅根據【說明節錄】的條列或文字，整理 1–5 點短句，保留原順序與關鍵事由/法源/事證。
-7) agent_todo：以業務員實作視角，列出 1–5 條可執行待辦（動詞開頭），例如「查詢並提供XXX之保單資料」、「於期限前回覆法院」。
-8) deadline：若文中出現「請於X日內」「最遲於YYYY/MM/DD前」等期限，原樣輸出；無則 null。
-9) required_documents：若有「檢附/提供以下資料」等要求，整理為清單；無則空陣列。
-10) actions：從文中抽取（查詢/撤銷/扣押/通知/補件/更正/函覆/檢送/轉知/執行/調查），沒有就空陣列。
-11) 不確定時寧可設為 null 或空陣列，不要猜。
-
-【範例（示意）】
-<subject>關於查詢債務人保單資料</subject>
-<body>本院通知：請全球人壽提供王小明（身分證A123456789）名下壽險保單PL20250101之相關資料，以利執行。</body>
-<explain>
-一、依強制執行需求，需確認債務人保單資產。
-二、前案資料不足，請補齊。
-</explain>
-
-對應輸出：
-{{
-  "category": "{category}",
-  "title": "法院請求提供王小明之壽險保單資料",
-  "summary": "本院函請全球人壽提供王小明名下壽險保單PL20250101之資料，以配合法院強制執行程序。",
-  "persons": [{{"name": "王小明", "id_number": "A123456789"}}],
-  "policy_numbers": ["PL20250101"],
-  "policy_type": "壽險",
-  "insurer": "全球人壽",
-  "actions": ["查詢", "通知"],
-  "date_mentions": [],
-  "deadline": null,
-  "rationale_points": ["依強制執行程序需確認保單資產", "前案資料不足，需補齊"],
-  "required_documents": ["王小明名下壽險保單PL20250101之基本資料與狀態"],
-  "agent_todo": ["查詢王小明之PL20250101保單資料並彙整", "將資料回覆本院（依指定格式/管道）"],
-  "extra": {{"doc_no": null, "court": "本院", "insured_name": "王小明", "policy_holder": null}}
-}}
-
-【待處理文本】
-<subject>
-{subject}
-</subject>
-
-<body>
-{body}
-</body>
-
-【說明節錄（若無則空）】
-<explain>
-{explain}
-</explain>
-"""
-
-# =========================
-# 工具：HTTP、JSON 容錯、截斷、段落擷取
-# =========================
-
-def http_post_json(url: str, payload: Dict[str, Any], timeout: int = 600) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        return json.loads(raw.decode("utf-8"))
-
-def safe_json_loads_loose(s: str) -> dict:
-    s = s.strip()
-    if s.startswith("```"):
-        fence_end = s.find("```", 3)
-        if fence_end != -1:
-            inner = s[3:fence_end].strip()
-            if inner.lower().startswith("json"):
-                inner = inner[4:].strip()
-            s = inner.strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    first = s.find("{")
-    if first == -1:
-        raise ValueError("No JSON object start '{' found.")
-    stack = 0; in_str = False; esc = False; end_idx = -1
-    for i, ch in enumerate(s[first:], start=first):
-        if in_str:
-            if esc: esc = False
-            elif ch == '\\': esc = True
-            elif ch == '"': in_str = False
-        else:
-            if ch == '"': in_str = True
-            elif ch == '{': stack += 1
-            elif ch == '}':
-                stack -= 1
-                if stack == 0:
-                    end_idx = i; break
-    if end_idx == -1:
-        raise ValueError("Unbalanced braces; cannot extract JSON object.")
-    candidate = s[first:end_idx+1].strip()
-    return json.loads(candidate)
-
-def truncate_text(text: str, max_chars: int, mode: str = "headtail") -> str:
-    if not text or len(text) <= max_chars:
-        return text
-    if mode == "head":
-        return text[:max_chars] + f"\n…(已截斷，原長 {len(text)} 字)…"
-    head = max_chars // 2
-    tail = max_chars - head
-    return text[:head] + f"\n…(中略，原長 {len(text)} 字，已截斷)…\n" + text[-tail:]
-
-# --- 「說明」段落擷取：從 body 中切出「說明」到下一段標頭或結尾 ---
-SECTION_HEAD_RE = re.compile(r"^\s*(主旨|說明|辦法|依據|法源|檢附|附件|注意事項|此致)\s*[:：]?\s*$", re.MULTILINE)
-BULLET_RE = re.compile(r"^\s*(?:[一二三四五六七八九十]\s*[、.]|[0-9]+\s*[).、]|•|-)\s*(.+)$", re.MULTILINE)
-
-def extract_explain_segment(body: str) -> str:
-    if not body:
-        return ""
-    # 找出所有段標頭位置
-    matches = list(SECTION_HEAD_RE.finditer(body))
-    if not matches:
-        return ""
-    # 找到最近一個「說明」標頭
-    idx = None
-    for i, m in enumerate(matches):
-        if m.group(1) == "說明":
-            idx = i
-    if idx is None:
-        return ""
-    start = matches[idx].end()
-    end = len(body)
-    if idx + 1 < len(matches):
-        end = matches[idx + 1].start()
-    segment = body[start:end].strip()
-    return segment
-
-def extract_explain_bullets(segment: str, max_points: int = 6) -> List[str]:
-    if not segment:
-        return []
-    bullets = [m.group(1).strip() for m in BULLET_RE.finditer(segment)]
-    # 若沒偵測到條列，取前幾行做短句
-    if not bullets:
-        lines = [ln.strip(" 　") for ln in segment.splitlines() if ln.strip()]
-        bullets = lines[:max_points]
-    return bullets[:max_points]
-
-# =========================
-# Ollama 後端
-# =========================
-
-def call_llm_ollama(model: str, system: str, user: str, temperature: float = 0.0, num_ctx: Optional[int] = None) -> str:
-    url = f"{BACKEND_CONFIG['base_url']}/api/chat"
-    options: Dict[str, Any] = {"temperature": temperature}
-    if num_ctx:
-        options["num_ctx"] = num_ctx
-    payload = {
-        "model": model,
-        "options": options,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "format": "json",
-        "stream": False
-    }
-    for attempt in range(3):
+def parse_due_date(text: str, today: Optional[dt.date]=None) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """回傳 (due_date_iso, reason_phrase, days_left)"""
+    today = today or dt.date.today()
+    # 1) 直接日期
+    m = RE_DATE_SLASH.search(text)
+    if not m:
+        m = RE_DATE_CHT.search(text)
+        if m:
+            y = tw_roc_to_ad(int(m.group(1))); mm = int(m.group(2)); dd = int(m.group(3))
+            try:
+                d = dt.date(y, mm, dd)
+                return d.isoformat(), m.group(0), (d - today).days
+            except ValueError:
+                pass
+    else:
+        y, mm, dd = map(int, m.groups())
         try:
-            data = http_post_json(url, payload, timeout=600)
-            msg = data.get("message") or {}
-            content = msg.get("content", "")
-            if not content and "messages" in data and isinstance(data["messages"], list) and data["messages"]:
-                content = data["messages"][-1].get("content", "")
-            return content
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(2 * (attempt + 1))
+            d = dt.date(y, mm, dd)
+            return d.isoformat(), m.group(0), (d - today).days
+        except ValueError:
+            pass
+    # 2) 於X日內
+    m = RE_WITHIN_DAYS.search(text)
+    if m:
+        days = int(m.group(1))
+        d = today + dt.timedelta(days=days)
+        return d.isoformat(), m.group(0), days
+    return None, None, None
 
-# =========================
-# 後處理：補強/校驗
-# =========================
+def find_actions(text: str) -> List[Dict[str,str]]:
+    acts = []
+    for canon, variants in ACTION_MAP.items():
+        for v in variants:
+            if v in text:
+                acts.append({"action": canon, "trigger": v})
+                break
+    return acts
 
-def _unique_keep(seq: List[str]) -> List[str]:
-    seen, out = set(), []
-    for s in seq or []:
-        s = str(s).strip()
-        if s and s not in seen:
-            seen.add(s); out.append(s)
+def find_policies(text: str) -> List[str]:
+    return list({m.group(1) for m in RE_POLICY.finditer(text)})
+
+def find_ids(text: str) -> List[str]:
+    return list({m.group(1) for m in RE_ID.finditer(text)})
+
+def find_names(text: str) -> List[Dict[str,str]]:
+    # 先從角色詞附近抓
+    out = []
+    for m in RE_NAME_BY_ROLE.finditer(text):
+        out.append({"role": m.group(1), "name": m.group(2)})
     return out
 
-def ensure_schema_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(rec)
-    # 既有
-    out.setdefault("category", None)
-    out.setdefault("title", ""); out.setdefault("summary", "")
-    if not isinstance(out.get("persons"), list): out["persons"] = []
-    if not isinstance(out.get("policy_numbers"), list): out["policy_numbers"] = []
-    if "policy_type" not in out: out["policy_type"] = None
-    if "insurer" not in out: out["insurer"] = None
-    if not isinstance(out.get("actions"), list): out["actions"] = []
-    if not isinstance(out.get("date_mentions"), list): out["date_mentions"] = []
-    if not isinstance(out.get("extra"), dict): out["extra"] = {}
-    out["extra"].setdefault("doc_no", None)
-    out["extra"].setdefault("court", None)
-    out["extra"].setdefault("insured_name", None)
-    out["extra"].setdefault("policy_holder", None)
-    # 新增
-    out.setdefault("deadline", None)
-    if not isinstance(out.get("rationale_points"), list): out["rationale_points"] = []
-    if not isinstance(out.get("required_documents"), list): out["required_documents"] = []
-    if not isinstance(out.get("agent_todo"), list): out["agent_todo"] = []
-    return out
+def redact_name(name: str) -> str:
+    if len(name) == 2:
+        return name[0] + "○"
+    if len(name) == 3:
+        return name[0] + "○" + name[2]
+    return name[0] + "○"*(len(name)-2) + name[-1]
 
-def validate_and_enhance(record: Dict[str, Any], category: str, subject: str, body: str) -> Dict[str, Any]:
-    out = ensure_schema_keys(record)
-    s = f"{subject}\n{body}"
+def redact_id(twid: str) -> str:
+    # A1******89
+    return twid[:2] + "*"*6 + twid[-2:]
 
-    # persons：期望 [{"name","id_number"}]
-    persons_in = out.get("persons", [])
-    persons: List[Dict[str, Any]] = []
-    for p in persons_in:
-        if isinstance(p, dict):
-            name = str(p.get("name", "")).strip()
-            idn  = p.get("id_number", None)
-            if name and name not in ROLE_STOPWORDS:
-                if isinstance(idn, str):
-                    idn = idn.strip()
-                    if not TW_ID_RE.fullmatch(idn):
-                        idn = None
-                else:
-                    idn = None if idn is not None else None
-                persons.append({"name": name, "id_number": idn})
-    # 若模型漏抓姓名，從文本補3個候選
-    cand_names = [c for c in CNAME_RE.findall(s) if c not in ROLE_STOPWORDS]
-    existing = {p["name"] for p in persons}
-    for n in cand_names:
-        if n not in existing and len(persons) < 3:
-            persons.append({"name": n, "id_number": None})
-            existing.add(n)
-    out["persons"] = persons
+def mask_list(vals: List[str], fn) -> List[str]:
+    return [fn(v) for v in vals]
 
-    # policy_numbers：正則補
-    pols = _unique_keep(list(out.get("policy_numbers", [])) + POLICY_RE.findall(s))
-    out["policy_numbers"] = pols
+def extract_core_fields(text: str) -> Dict:
+    subject = (RE_SUBJECT.search(text) or [None, ""])[1].strip() if RE_SUBJECT.search(text) else ""
+    desc1   = (RE_DESC1.search(text) or [None, ""])[1].strip() if RE_DESC1.search(text) else ""
+    basis   = (RE_BASIS.search(text) or [None, ""])[1].strip() if RE_BASIS.search(text) else ""
+    agency  = (RE_AGENCY.search(text) or [None, ""])[1].strip() if RE_AGENCY.search(text) else ""
+    caseid  = (RE_CASEID.search(text) or [None, ""])[1].strip() if RE_CASEID.search(text) else ""
+    return {"subject":subject, "desc1":desc1, "basis":basis, "agency":agency, "case_id":caseid}
 
-    # policy_type 關鍵詞補
-    if not out.get("policy_type"):
-        if "壽險" in s: out["policy_type"] = "壽險"
-        elif "意外險" in s: out["policy_type"] = "意外險"
-        elif "醫療險" in s or "醫療保險" in s: out["policy_type"] = "醫療險"
-        elif "傷害險" in s: out["policy_type"] = "傷害險"
-        elif "火險" in s: out["policy_type"] = "火險"
-        else: out["policy_type"] = None
-
-    # actions 關鍵詞補
-    if not out.get("actions"):
-        acts = []
-        for k in ["查詢","撤銷","扣押","通知","補件","更正","函覆","檢送","轉知","執行","調查"]:
-            if k in s: acts.append(k)
-        out["actions"] = _unique_keep(acts)
-
-    # insurer：若缺則從正文補
-    if not out.get("insurer"):
-        for kw in KNOWN_INSURERS:
-            if kw in s:
-                out["insurer"] = kw; break
-
-    # deadline：若缺則用正則補
-    if not out.get("deadline"):
-        dl = []
-        for pat in DEADLINE_PATTERNS:
-            for m in pat.finditer(s):
-                g = [x for x in m.groups() if x]
-                dl.extend(g)
-        out["deadline"] = dl[0] if dl else None
-
-    # category 覆寫來源
-    out["category"] = category
-    return out
-
-# =========================
-# 主流程
-# =========================
-
-def build_user_prompt(category: str, subject: str, body: str, explain: str) -> str:
-    return USER_PROMPT_TEMPLATE.format(
-        SCHEMA_JSON=SCHEMA_JSON,
-        category=category,
-        subject=subject or "",
-        body=body or "",
-        explain=explain or ""
-    )
-
-def call_llm(category: str, subject: str, body: str, explain: str, max_chars: int,
-             truncate_mode: str = "headtail", num_ctx: Optional[int] = None) -> Dict[str, Any]:
-    body_for_llm = truncate_text(body, max_chars, mode=truncate_mode) if body and len(body) > max_chars else (body or "")
-    # 說明段保留較完整，但也做適度上限（避免爆 context）
-    explain_trunc = truncate_text(explain, max(800, max_chars // 2), mode="head") if explain and len(explain) > max(800, max_chars // 2) else (explain or "")
-    user_prompt = build_user_prompt(category, subject, body_for_llm, explain_trunc)
-
-    raw = call_llm_ollama(
-        model=BACKEND_CONFIG["model"],
-        system=SYSTEM_PROMPT,
-        user=user_prompt,
-        temperature=BACKEND_CONFIG["temperature"],
-        num_ctx=num_ctx,
-    )
-    try:
-        data = safe_json_loads_loose(raw)
-    except Exception as e:
-        preview = raw[:400].replace("\n", "\\n")
-        raise ValueError(f"LLM 回傳非純 JSON：{e}; 片段預覽={preview}")
-    return data
-
-def process_all(input_dir: Path, output_dir: Path,
-                only_categories: Optional[List[str]] = None,
-                limit: Optional[int] = None,
-                max_chars: int = MAX_CHARS_DEFAULT,
-                truncate_mode: str = "headtail",
-                num_ctx: Optional[int] = None) -> None:
-    output_dir.mkdir(exist_ok=True, parents=True)
-    files = sorted(input_dir.glob("*.jsonl"))
-
-    if only_categories:
-        allowed = set(only_categories)
-        files = [f for f in files if f.stem in allowed]
-
-    if not files:
-        print(f"⚠️ 在 {input_dir} 找不到 .jsonl")
-        return
-
-    for infile in files:
-        category = infile.stem
-        outfile = output_dir / f"{category}.jsonl"
-        n_ok, n_err = 0, 0
-
-        with open(infile, "r", encoding="utf-8") as fin, open(outfile, "w", encoding="utf-8") as fout:
-            for i, line in enumerate(fin):
-                if limit and i >= limit:
-                    break
-                try:
-                    rec = json.loads(line)
-                except Exception as e:
-                    n_err += 1
-                    print(f"❌ 輸入 JSON 解析失敗: {infile.name} line {i+1}: {e}")
-                    continue
-
-                try:
-                    subject = rec.get("subject", "") or ""
-                    body = rec.get("body", "") or ""
-                    # 擷取「說明」段
-                    explain_seg = extract_explain_segment(body)
-                    # 如遇沒有標頭，試圖從條列推測說明
-                    if not explain_seg:
-                        # 若正文中條列很多，取前 6 條當作說明候選（保守）
-                        bullets = extract_explain_bullets(body, max_points=6)
-                        explain_seg = "\n".join(bullets)
-
-                    llm_json = call_llm(
-                        category, subject, body, explain_seg,
-                        max_chars=max_chars, truncate_mode=truncate_mode, num_ctx=num_ctx
-                    )
-                    final_json = validate_and_enhance(llm_json, category, subject, body)
-
-                    # 附加來源資訊
-                    final_json["filename"] = rec.get("filename")
-                    # 回填文號到 extra.doc_no（若有）
-                    if "meta" in rec and isinstance(rec["meta"], dict):
-                        doc_no = rec["meta"].get("doc_no")
-                        if doc_no:
-                            final_json.setdefault("extra", {})
-                            final_json["extra"]["doc_no"] = doc_no
-
-                    fout.write(json.dumps(final_json, ensure_ascii=False) + "\n")
-                    n_ok += 1
-                except Exception as e:
-                    n_err += 1
-                    print(f"❌ {infile.name} line {i+1}: {e}")
-
-        print(f"✅ {category}: 成功 {n_ok} 筆，失敗 {n_err} 筆 -> {outfile}")
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="以本地 Ollama 對公文做結構化摘要（含說明段落、業務員待辦）")
-    p.add_argument("--input-dir", type=str, default="parsed", help="輸入目錄（extract_body.py 的輸出）")
-    p.add_argument("--output-dir", type=str, default="summaries", help="輸出目錄（每類別一個 .jsonl）")
-    p.add_argument("--model", type=str, default=BACKEND_CONFIG["model"], help="Ollama 模型名稱，如 qwen2.5:3b-instruct")
-    p.add_argument("--categories", nargs="*", default=None, help="只處理指定類別（檔名 stem），如：保單查詢 通知函")
-    p.add_argument("--limit", type=int, default=None, help="每檔前 N 筆測試用")
-    p.add_argument("--max-chars", type=int, default=MAX_CHARS_DEFAULT, help="正文最大字元數（超過會截斷）")
-    p.add_argument("--truncate-mode", choices=["head", "headtail"], default="headtail",
-                   help="截斷策略：head=只留開頭、headtail=保留頭尾（預設）")
-    p.add_argument("--num-ctx", type=int, default=None,
-                   help="Ollama context tokens（如 8192/16384，需模型支援）")
-    return p.parse_args()
+def build_summary_text(cls: str, agency: str, who: List[Dict[str,str]], actions: List[Dict[str,str]],
+                       policies: List[str], due_phrase: Optional[str], due_date: Optional[str]) -> str:
+    who_str = "、".join([f"{w.get('role','')} {w.get('name','')}".strip() for w in who]) if who else ""
+    act_str = "、".join(sorted({a['action'] for a in actions})) if actions else ""
+    pol_str = "、".join(policies[:3]) if policies else ""
+    segs = []
+    if agency: segs.append(f"{agency}")
+    if cls:    segs.append(f"就「{cls}」來文")
+    if who_str: segs.append(f"涉及 {who_str}")
+    if pol_str: segs.append(f"關聯保單 {pol_str}")
+    if act_str: segs.append(f"需辦事項：{act_str}")
+    if due_phrase or due_date:
+        if due_phrase and due_date:
+            segs.append(f"{due_phrase}（至 {due_date}）")
+        elif due_phrase:
+            segs.append(due_phrase)
+        else:
+            segs.append(f"截至 {due_date}")
+    return "；".join(segs) + "。"
 
 def main():
-    args = parse_args()
-    BACKEND_CONFIG["model"] = args.model
-    print(f"🚀 backend=ollama  model={args.model}  max_chars={args.max_chars}  truncate_mode={args.truncate_mode}  num_ctx={args.num_ctx}")
-    process_all(
-        Path(args.input_dir),
-        Path(args.output_dir),
-        args.categories,
-        args.limit,
-        max_chars=args.max_chars,
-        truncate_mode=args.truncate_mode,
-        num_ctx=args.num_ctx,
-    )
-    print("🎉 完成")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--records_csv", type=str, default="data/processed/test.csv",
+                    help="含 doc_id、label 欄位；若沒有，請改指向 records.csv")
+    ap.add_argument("--pred_csv", type=str, default="data/processed/test_predictions.csv",
+                    help="含 doc_id、pred（預測類別），可無；若無則使用 label 當類別")
+    ap.add_argument("--raw_root", type=str, default="raw", help="原始 txt 檔根目錄（底下是九個子資料夾）")
+    ap.add_argument("--out_dir", type=str, default="data/processed")
+    ap.add_argument("--fulltext_col", type=str, default="", help="若 records_csv 內含全文欄位，可指定，如 FullText")
+    ap.add_argument("--no_redact", action="store_true", help="不要脫敏姓名/身分證")
+    ap.add_argument("--urgent_days", type=int, default=7, help="幾日內視為急件")
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(args.records_csv)
+    pred_map = {}
+    pred_path = Path(args.pred_csv)
+    if pred_path.exists():
+        pred_df = pd.read_csv(pred_path)
+        pred_map = {r.doc_id: str(r.pred) for _, r in pred_df.iterrows() if "doc_id" in pred_df.columns and "pred" in pred_df.columns}
+
+    rows_out = []
+    today = dt.date.today()
+
+    for _, r in df.iterrows():
+        doc_id = str(r.get("doc_id"))
+        label  = str(r.get("label")) if "label" in r else ""
+        cls    = pred_map.get(doc_id, label)
+
+        # 讀全文
+        if args.fulltext_col and args.fulltext_col in df.columns:
+            text = str(r.get(args.fulltext_col,"") or "")
+        else:
+            # raw/<label>/<doc_id>.txt
+            p = Path(args.raw_root) / label / f"{doc_id}.txt"
+            if not p.exists():
+                # 允許在 records.csv 沒 label 的情況改從任何子資料夾尋找
+                cand = list(Path(args.raw_root).glob(f"**/{doc_id}.txt"))
+                text = cand[0].read_text(encoding="utf-8", errors="ignore") if cand else ""
+            else:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+
+        core = extract_core_fields(text)
+        ids  = find_ids(text)
+        who  = find_names(text)
+        acts = find_actions(text)
+        pols = find_policies(text)
+        due_date, due_phrase, days_left = parse_due_date(text, today=today)
+
+        # 急件判斷
+        urgent = False
+        reason = ""
+        if any(tok in text for tok in URGENT_TOKENS):
+            urgent = True; reason = "命中急件詞"
+        if days_left is not None and days_left <= args.urgent_days:
+            urgent = True; reason = f"{args.urgent_days}日內"
+
+        # 脫敏
+        ids_out = ids if args.no_redact else mask_list(ids, redact_id)
+        who_out = who if args.no_redact else [{"role": w.get("role",""), "name": redact_name(w.get("name",""))} for w in who]
+
+        summary_text = build_summary_text(
+            cls=cls or "",
+            agency= core.get("agency",""),
+            who=who_out,
+            actions=acts,
+            policies=pols,
+            due_phrase=due_phrase,
+            due_date=due_date
+        )
+
+        item = {
+            "doc_id": doc_id,
+            "class": cls,
+            "urgency": {"is_urgent": bool(urgent), "reason": reason, "due_date": due_date},
+            "who": who_out,
+            "ids": ids_out,
+            "policies": pols,
+            "basis": [core.get("basis","")] if core.get("basis") else [],
+            "agency": core.get("agency",""),
+            "case_id": core.get("case_id",""),
+            "subject": core.get("subject",""),
+            "summary_text": summary_text
+        }
+        rows_out.append(item)
+
+    # 輸出
+    jpath = out_dir / "summaries.jsonl"
+    with jpath.open("w", encoding="utf-8") as f:
+        for it in rows_out:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+    # 也輸出 CSV（方便快速檢視）
+    cpath = out_dir / "summaries.csv"
+    flat = []
+    for it in rows_out:
+        flat.append({
+            "doc_id": it["doc_id"],
+            "class": it["class"],
+            "is_urgent": it["urgency"]["is_urgent"],
+            "due_date": it["urgency"]["due_date"],
+            "agency": it["agency"],
+            "case_id": it["case_id"],
+            "ids": "；".join(it["ids"]),
+            "who": "；".join([f"{w['role']}:{w['name']}" for w in it["who"]]),
+            "policies": "；".join(it["policies"]),
+            "basis": "；".join(it["basis"]),
+            "subject": it["subject"],
+            "summary_text": it["summary_text"]
+        })
+    pd.DataFrame(flat).to_csv(cpath, index=False, encoding="utf-8")
+
+    print(f"[OK] 已輸出：\n- {jpath}\n- {cpath}")
 
 if __name__ == "__main__":
     main()
