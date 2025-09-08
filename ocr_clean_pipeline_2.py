@@ -1,243 +1,112 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import argparse
 from pathlib import Path
 import sys
 import re
-import regex as re2
-from cleantext import clean
-from opencc import OpenCC
-import jieba
+import unicodedata
 
-# ============== 新增：側邊噪音清理 ==============
-PUNCT_LINE_RE = re.compile(r'^[\s\.\·⋯…‧・\-—─‐\|／/\\、，,。:：;；!！?？()\[\]【】{}<>〈〉《》"“”\'’`~^＋+＝=\*＊]+$')
+# 目標：無論出現在句中或獨立成行，都刪掉下列字元（含常見簡繁體）
+BLACKLIST = set(list("裝订訂装線线"))
 
-SIDEWORDS = {"裝訂線", "騎縫章", "騎縫", "裝訂", "保密", "非公開", "附件", "封條"}
-
-def looks_like_punct_noise(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return False
-    # 純標點/符號噪音
-    if PUNCT_LINE_RE.match(s):
-        return True
-    # 很短且標點比例高
-    non_space = re2.sub(r'\s+', '', s)
-    if len(non_space) <= 4:
-        punct = sum(1 for ch in non_space if re2.match(r'\p{P}|\p{S}', ch))
-        if len(non_space) > 0 and punct / len(non_space) >= 0.6:
-            return True
-    return False
-
-def remove_margin_artifacts(text: str) -> str:
-    """
-    移除：
-    1) 純標點/符號行
-    2) 很短且標點比例高的行
-    3) 多行連續單字（縱排）形成的側邊詞，例如「裝 / 訂 / 線」→ 裝訂線
-    """
-    lines = text.splitlines()
-
-    # 第一輪：丟掉明顯的標點噪音行
-    kept = []
-    for ln in lines:
-        if looks_like_punct_noise(ln):
-            continue
-        kept.append(ln)
-
-    # 第二輪：偵測連續單字縱排
-    res = []
-    buf = []
-
-    def flush_buf():
-        if not buf:
-            return
-        joined = ''.join(ch for ch in buf if ch.strip())
-        joined_no_punct = re2.sub(r'[\p{P}\p{S}\s]+', '', joined)
-        # 偵測是否為常見側邊詞（包含即可）
-        drop = any(sw in joined_no_punct for sw in SIDEWORDS)
-        if not drop:
-            res.extend(buf)
-        # 清空
-        buf.clear()
-
-    for ln in kept:
-        s = ln.strip()
-        # 單字行：允許前後有 0~2 個符號（像「. 裝」或「訂 .」）
-        if re2.match(r'^[\p{P}\p{S}\s]{0,2}\p{Lo}[\p{P}\p{S}\s]{0,2}$', s):
-            # 只保留 Lo（letter other：漢字等）一個字；空白/標點視為噪音
-            core = re2.sub(r'[\p{P}\p{S}\s]+', '', s)
-            if len(core) == 1:
-                buf.append(core)
-                continue
-        # 遇到非單字行 → 先結算前面的縱排緩衝
-        flush_buf()
-        res.append(ln)
-    flush_buf()
-
-    # 第三輪：壓縮多餘的空白行
-    out = []
-    prev_blank = False
-    for ln in res:
-        if ln.strip() == '':
-            if not prev_blank:
-                out.append('')
-            prev_blank = True
-        else:
-            out.append(ln)
-            prev_blank = False
-
-    return '\n'.join(out)
-
-# ============== 第 1 層：clean-text + OpenCC ==============
-def stage1_clean_and_convert(text: str, cc_mode: str = "t2tw") -> str:
-    t = clean(
-        text,
-        fix_unicode=True,
-        to_ascii=False,
-        lower=False,
-        no_line_breaks=False,
-        no_urls=False,
-        no_emails=False,
-        no_phone_numbers=False,
-        no_numbers=False,
-        no_digits=False,
-        no_currency_symbols=False,
-        no_punct=False,
-        replace_with_punct="。",
-        replace_with_url=" ",
-        replace_with_email=" ",
-        replace_with_phone_number=" ",
-        replace_with_number=" ",
-        replace_with_digit=" ",
-        replace_with_currency_symbol=" ",
-    )
-    # 去控制/格式字元
-    t = re2.sub(r'[\p{Cc}\p{Cf}]', ' ', t)
-    # 正規化空白
-    t = re2.sub(r'[\p{Zs}\t]+', ' ', t)
-    # 清掉多餘的空行空白
-    t = re2.sub(r'[ \t]*\n[ \t]*', '\n', t)
-
-    # 先做側邊噪音清除（可放在 OpenCC 前後都行；這裡放前也可）
-    t = remove_margin_artifacts(t)
-
-    try:
-        cc = OpenCC(cc_mode)  # 's2t', 't2tw', 't2s' 等
-        t = cc.convert(t)
-    except Exception as e:
-        print(f"[警告] OpenCC 初始化失敗（{e}），跳過簡繁轉換。", file=sys.stderr)
-
-    return t.strip()
-
-# ============== 第 2 層：合併錯誤換行 + 斷句規則 ==============
-SENT_END = r'[。！？!?；;]'
-QUOTE_CLOSERS = '」』”’›》〉）】'
-SECTION_HEAD_PAT = re.compile(
-    r'^('
-    r'(主旨|說明|附件|備註|結論|參考|辦法|依據)\s*[:：]'
-    r'|[（(]?[一二三四五六七八九十]\)'
-    r'|[一二三四五六七八九十]+、'
-    r'|\d+、'
-    r')'
+# 移除的零寬/不可見字元（常見 OCR/複製貼上殘留）
+INVISIBLES_RE = re.compile(
+    r"[\u200B-\u200D\uFEFF\u2060\u00AD\u034F]"   # ZWSP, BOM, WJ, SHY, CGJ
 )
 
-def merge_broken_lines(t: str) -> str:
-    lines = t.splitlines()
-    merged = []
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            merged.append('')
-            continue
-        next_line = lines[i+1].strip() if i + 1 < len(lines) else ''
-        is_section_head = bool(SECTION_HEAD_PAT.match(next_line))
-        ends_with_punct = bool(re.search(SENT_END + r'[' + re.escape(QUOTE_CLOSERS) + r']*$', line))
-        if not ends_with_punct and not is_section_head:
-            if merged:
-                merged[-1] = (merged[-1].rstrip() + ' ' + line.lstrip()).strip()
-            else:
-                merged.append(line)
-        else:
-            merged.append(line)
-    return '\n'.join(merged)
+# 只剩標點/符號/空白的行（清掉）
+PUNCT_ONLY_RE = re.compile(r'^[\s\p{P}\p{S}]+$', re.UNICODE)
 
-def normalize_punct(t: str) -> str:
-    t = re.sub(r'[.]{2,}', '。', t)
-    t = re.sub(r'。{2,}', '。', t)
-    t = re.sub(r'[，,]{2,}', '，', t)
-    t = re.sub(r'[:]{1}', '：', t)
-    t = re.sub(r'^\s*[,，。：;；]+', '', t, flags=re.MULTILINE)
-    t = t.replace('(', '（').replace(')', '）')
-    t = t.replace('[', '【').replace(']', '】')
-    t = t.replace('"', '”').replace("'", "’")
+# Python 的 re 不支援 \p{...}，用簡易近似：去掉所有 Unicode 類別為字母或數字後是否為空
+def is_punct_only(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return True
+    # 保留「字母/數字/漢字」；若去掉後沒東西，就視為純標點/空白
+    kept = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        # L* = Letter, N* = Number, Lo = Letter other(含漢字)
+        if cat.startswith("L") or cat.startswith("N"):
+            kept.append(ch)
+    return len("".join(kept).strip()) == 0
+
+def read_text_any_encoding(path: Path) -> tuple[str, str]:
+    encodings = [
+        "utf-8-sig", "utf-8",
+        "cp950", "big5",
+        "gb18030",
+        "utf-16", "utf-16le", "utf-16be",
+    ]
+    for enc in encodings:
+        try:
+            txt = path.read_text(encoding=enc)
+            return txt, enc
+        except Exception:
+            continue
+    # 最後手段：忽略錯誤讀 UTF-8
+    txt = path.read_text(encoding="utf-8", errors="ignore")
+    return txt, "utf-8(ignore)"
+
+def normalize_text(t: str) -> str:
+    # 正規化到 NFKC，統一相容字型（全形/半形、相容漢字等）
+    t = unicodedata.normalize("NFKC", t)
+    # 去掉不可見字符
+    t = INVISIBLES_RE.sub("", t)
     return t
 
-def sentence_split_zh(t: str) -> list:
-    t = re2.sub(r'[ \t]+', ' ', t)
-    paras = [p.strip() for p in t.split('\n') if p.strip()]
-    sents = []
-    for p in paras:
-        pieces = re2.split(rf'({SENT_END}[{re2.escape(QUOTE_CLOSERS)}]*)(?=$| )', p)
-        for i in range(0, len(pieces), 2):
-            chunk = pieces[i].strip()
-            end = pieces[i+1] if i+1 < len(pieces) else ''
-            if not chunk:
-                continue
-            if end:
-                sents.append((chunk + end).strip())
-            else:
-                if len(chunk) >= 25:
-                    sents.append(chunk + '。')
-                else:
-                    sents.append(chunk)
-    sents = [s.strip() for s in sents if re2.sub(r'\p{P}+', '', s).strip()]
-    return sents
-
-def basic_punct_fix(sents):
-    fixed = []
-    for s in sents:
-        if SECTION_HEAD_PAT.match(s):
-            fixed.append(s if s.endswith('：') else s)
+def remove_blacklist_chars(t: str) -> tuple[str, int]:
+    removed = 0
+    out_chars = []
+    for ch in t:
+        if ch in BLACKLIST:
+            removed += 1
             continue
-        if not re.search(r'[。！？；!?]$', s):
-            s = s + '。'
-        fixed.append(s)
-    return fixed
+        out_chars.append(ch)
+    return "".join(out_chars), removed
 
-# ============== 主流程 ==============
-def process_text(raw: str, cc_mode: str):
-    t1 = stage1_clean_and_convert(raw, cc_mode=cc_mode)
-    t2 = merge_broken_lines(t1)
-    t2 = normalize_punct(t2)
-    sents = sentence_split_zh(t2)
-    sents2 = basic_punct_fix(sents)
-    out = "\n".join(sents2)
-    out = normalize_punct(out)
-    return out.strip()
+def cleanup_lines(t: str) -> str:
+    lines = t.splitlines()
+    cleaned = []
+    for ln in lines:
+        # 行尾/行首空白收斂
+        s = ln.strip()
+        if not s:
+            # 空行直接略過
+            continue
+        if is_punct_only(s):
+            # 只有標點/符號的行略過（處理 .. . .. ... 這種）
+            continue
+        cleaned.append(s)
+    return "\n".join(cleaned)
 
 def main():
-    ap = argparse.ArgumentParser(description="OCR .txt 清洗（含側邊噪音處理；無 LanguageTool）")
+    ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』（含簡繁體變體），並清理空白/純標點行。")
     ap.add_argument("input", help="輸入 .txt 檔路徑")
-    ap.add_argument("-o", "--output", help="輸出檔名（預設：同名 *.clean.txt）")
-    ap.add_argument("--cc", default="t2tw", help="OpenCC 模式（預設 t2tw；常見：s2t, t2tw, t2s）")
+    ap.add_argument("-o", "--output", help="輸出檔名（預設 input.clean.txt）")
     args = ap.parse_args()
 
     in_path = Path(args.input)
     if not in_path.exists():
         print(f"[錯誤] 找不到檔案：{in_path}", file=sys.stderr)
         sys.exit(1)
+
+    raw, used_enc = read_text_any_encoding(in_path)
+    print(f"[INFO] 讀取編碼：{used_enc}")
+
+    # 步驟 1：Unicode 正規化 + 去不可見字元
+    t = normalize_text(raw)
+
+    # 步驟 2：刪除黑名單字元（裝/訂/線 + 简体）
+    t, removed = remove_blacklist_chars(t)
+    print(f"[INFO] 已移除目標字元數量：{removed}")
+
+    # 步驟 3：清掉因此變成空白/純標點的行
+    t = cleanup_lines(t)
+
     out_path = Path(args.output) if args.output else in_path.with_suffix(".clean.txt")
-
-    raw = in_path.read_text(encoding="utf-8", errors="ignore")
-
-    print("[INFO] 側邊噪音處理 + 第一層：clean-text + OpenCC…")
-    print("[INFO] 第二層：合併錯誤換行 + 中文斷句…")
-    print("[INFO] 第三層：規則式補標點（無 LanguageTool）…")
-    cleaned = process_text(raw, cc_mode=args.cc)
-
-    out_path.write_text(cleaned, encoding="utf-8")
+    out_path.write_text(t, encoding="utf-8")
     print(f"[完成] 已輸出：{out_path}")
 
 if __name__ == "__main__":
