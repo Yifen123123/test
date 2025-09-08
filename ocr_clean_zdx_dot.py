@@ -112,6 +112,31 @@ def remove_page_markers(t: str) -> str:
         cleaned.append(ln)
     return "\n".join(cleaned)
 
+def remove_garbled_text(t: str) -> str:
+    """
+    移除疑似亂碼行，例如 J<f V <f V、＾g 這類。
+    保留：有中文的行、正常數字/標點/格式的行。
+    """
+    lines = t.splitlines()
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # 如果包含中文，視為有效
+        if re.search(r'[\u4e00-\u9fff]', s):
+            cleaned.append(ln)
+            continue
+        # 如果全是字母+符號，長度<=5（大多是垃圾）
+        if re.match(r'^[A-Za-z\W_]{1,5}$', s):
+            continue
+        # 如果符號比例太高（非字母數字佔比 > 0.6），丟掉
+        non_alnum = sum(1 for ch in s if not ch.isalnum())
+        if len(s) > 0 and non_alnum / len(s) > 0.6:
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned)
+
 def main():
     ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』、行首點串（. .. ...）、並清理空白/純標點行（純標準庫版）。")
     ap.add_argument("input", help="輸入 .txt 檔路徑")
@@ -140,6 +165,9 @@ def main():
     t = remove_page_markers(t)
 
     # 5) 移除空行與純標點/符號行
+    t = cleanup_lines(t)
+    
+    # 6) 移除空行與純標點/符號行
     t = cleanup_lines(t)
 
     out_path = Path(args.output) if args.output else in_path.with_suffix(".clean.txt")
