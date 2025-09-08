@@ -112,30 +112,40 @@ def remove_page_markers(t: str) -> str:
         cleaned.append(ln)
     return "\n".join(cleaned)
 
-def remove_garbled_text(t: str) -> str:
+# ========= 新增：行內亂碼清理（重要） =========
+# CJK 範圍（基本區）
+CJK = r"\u4e00-\u9fff"
+CJK_PUNCT = r"。，、：；（）()《》【】「」『』—－─"
+
+def clean_inline_noise(t: str) -> str:
     """
-    移除疑似亂碼行，例如 J<f V <f V、＾g 這類。
-    保留：有中文的行、正常數字/標點/格式的行。
+    行內雜訊清理（保守）：
+    1) 刪孤立單一英文字母，位在「中文/標點/空白」之間（例：'。r 章' -> '。章'）
+    2) 刪連續雜訊符號（^ ˇ ＾ ~ ` \ / | < > 等）
+    3) 刪 '字母 + 雜訊符號(+空白) + 字母' 的小塊（例：'J<f'、'V <f'）
     """
-    lines = t.splitlines()
-    cleaned = []
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            continue
-        # 如果包含中文，視為有效
-        if re.search(r'[\u4e00-\u9fff]', s):
-            cleaned.append(ln)
-            continue
-        # 如果全是字母+符號，長度<=5（大多是垃圾）
-        if re.match(r'^[A-Za-z\W_]{1,5}$', s):
-            continue
-        # 如果符號比例太高（非字母數字佔比 > 0.6），丟掉
-        non_alnum = sum(1 for ch in s if not ch.isalnum())
-        if len(s) > 0 and non_alnum / len(s) > 0.6:
-            continue
-        cleaned.append(ln)
-    return "\n".join(cleaned)
+    def _clean_line(s: str) -> str:
+        # 2) 先拿掉連續雜訊符號
+        s = re.sub(r"[^\w\s" + CJK_PUNCT + r"]{2,}", " ", s)  # 兩個以上的非字母數字與非常見標點的符號塊
+        # 針對常見 ^ ˇ ＾ ~ ` \ / | < >
+        s = re.sub(r"[\^ˇ＾~`\\/|<>]+", "", s)
+
+        # 3) 字母 + 雜訊符號(+空白) + 字母 的小塊
+        s = re.sub(r"\b[A-Za-z]\s*[/\\|<>]\s*[A-Za-z]\b", "", s)
+
+        # 1) 刪孤立單一英文字母（左右都是 CJK/標點/空白或行界）
+        # lookbehind/lookahead 固定長度，Python re OK
+        s = re.sub(
+            fr"(?:(?<=^)|(?<=[\s{CJK}{CJK_PUNCT}]))[A-Za-z](?=(?:$|[\s{CJK}{CJK_PUNCT}]))",
+            "",
+            s
+        )
+
+        # 收斂多餘空白
+        s = re.sub(r"\s{2,}", " ", s).strip()
+        return s
+
+    return "\n".join(_clean_line(ln) for ln in t.splitlines())
 
 def main():
     ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』、行首點串（. .. ...）、並清理空白/純標點行（純標準庫版）。")
@@ -163,10 +173,10 @@ def main():
     
     # 4) 移除頁碼標籤
     t = remove_page_markers(t)
-
-    # 5) 移除空行與純標點/符號行
-    t = cleanup_lines(t)
     
+    # 5) 行內亂碼清理（包含 '。r 章'、'^^'、'J<f' 類）
+    t = clean_inline_noise(t)
+
     # 6) 移除空行與純標點/符號行
     t = cleanup_lines(t)
 
