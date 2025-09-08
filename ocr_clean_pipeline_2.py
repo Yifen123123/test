@@ -4,33 +4,21 @@
 import argparse
 from pathlib import Path
 import sys
-import re
 import unicodedata
 
 # 目標：無論出現在句中或獨立成行，都刪掉下列字元（含常見簡繁體）
 BLACKLIST = set(list("裝订訂装線线"))
 
-# 移除的零寬/不可見字元（常見 OCR/複製貼上殘留）
-INVISIBLES_RE = re.compile(
-    r"[\u200B-\u200D\uFEFF\u2060\u00AD\u034F]"   # ZWSP, BOM, WJ, SHY, CGJ
-)
-
-# 只剩標點/符號/空白的行（清掉）
-PUNCT_ONLY_RE = re.compile(r'^[\s\p{P}\p{S}]+$', re.UNICODE)
-
-# Python 的 re 不支援 \p{...}，用簡易近似：去掉所有 Unicode 類別為字母或數字後是否為空
-def is_punct_only(s: str) -> bool:
-    s = s.strip()
-    if not s:
-        return True
-    # 保留「字母/數字/漢字」；若去掉後沒東西，就視為純標點/空白
-    kept = []
-    for ch in s:
-        cat = unicodedata.category(ch)
-        # L* = Letter, N* = Number, Lo = Letter other(含漢字)
-        if cat.startswith("L") or cat.startswith("N"):
-            kept.append(ch)
-    return len("".join(kept).strip()) == 0
+# 常見不可見字元（零寬空白等）
+INVISIBLE_CHARS = {
+    "\u200B",  # ZWSP
+    "\u200C",  # ZWNJ
+    "\u200D",  # ZWJ
+    "\uFEFF",  # BOM
+    "\u2060",  # WJ
+    "\u00AD",  # SHY
+    "\u034F",  # CGJ
+}
 
 def read_text_any_encoding(path: Path) -> tuple[str, str]:
     encodings = [
@@ -50,10 +38,12 @@ def read_text_any_encoding(path: Path) -> tuple[str, str]:
     return txt, "utf-8(ignore)"
 
 def normalize_text(t: str) -> str:
-    # 正規化到 NFKC，統一相容字型（全形/半形、相容漢字等）
+    # 正規化（全半形等統一）
     t = unicodedata.normalize("NFKC", t)
-    # 去掉不可見字符
-    t = INVISIBLES_RE.sub("", t)
+    # 去掉不可見字元
+    if any(ch in t for ch in INVISIBLE_CHARS):
+        for ch in INVISIBLE_CHARS:
+            t = t.replace(ch, "")
     return t
 
 def remove_blacklist_chars(t: str) -> tuple[str, int]:
@@ -66,23 +56,35 @@ def remove_blacklist_chars(t: str) -> tuple[str, int]:
         out_chars.append(ch)
     return "".join(out_chars), removed
 
+def is_punct_only_line(s: str) -> bool:
+    """
+    若一行去掉所有「字母/數字」後，什麼都不剩，就視為只有標點/符號/空白。
+    （用 unicodedata.category，避免 \p 語法）
+    """
+    s = s.strip()
+    if not s:
+        return True
+    kept = []
+    for ch in s:
+        cat = unicodedata.category(ch)  # 'L*' 字母, 'N*' 數字, 'Lo' 含漢字
+        if cat.startswith("L") or cat.startswith("N"):
+            kept.append(ch)
+    return len("".join(kept).strip()) == 0
+
 def cleanup_lines(t: str) -> str:
     lines = t.splitlines()
     cleaned = []
     for ln in lines:
-        # 行尾/行首空白收斂
         s = ln.strip()
         if not s:
-            # 空行直接略過
             continue
-        if is_punct_only(s):
-            # 只有標點/符號的行略過（處理 .. . .. ... 這種）
+        if is_punct_only_line(s):
             continue
         cleaned.append(s)
     return "\n".join(cleaned)
 
 def main():
-    ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』（含簡繁體變體），並清理空白/純標點行。")
+    ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』（含简繁），並清理空白/純標點行（純標準庫版）。")
     ap.add_argument("input", help="輸入 .txt 檔路徑")
     ap.add_argument("-o", "--output", help="輸出檔名（預設 input.clean.txt）")
     args = ap.parse_args()
@@ -95,14 +97,9 @@ def main():
     raw, used_enc = read_text_any_encoding(in_path)
     print(f"[INFO] 讀取編碼：{used_enc}")
 
-    # 步驟 1：Unicode 正規化 + 去不可見字元
     t = normalize_text(raw)
-
-    # 步驟 2：刪除黑名單字元（裝/訂/線 + 简体）
     t, removed = remove_blacklist_chars(t)
     print(f"[INFO] 已移除目標字元數量：{removed}")
-
-    # 步驟 3：清掉因此變成空白/純標點的行
     t = cleanup_lines(t)
 
     out_path = Path(args.output) if args.output else in_path.with_suffix(".clean.txt")
