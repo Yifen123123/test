@@ -246,4 +246,19 @@ def main(argv=None):
     args = parse_args(argv)
     target = Path(args.path)
     cfg = CleanerConfig(encoding=args.encoding, level=LEVELS[args.level])
-    if args.keep: cfg.keep_keywords.extend(_
+    if args.keep: cfg.keep_keywords.extend(args.keep)
+    if args.ban:  cfg.banned_patterns.extend(args.ban)
+
+    if target.is_dir():
+        if not args.recursive:
+            print("提示：你提供的是資料夾。若要遞迴處理請加上 -r / --recursive")
+            return 0
+        walk_and_process(target, cfg, dry_run=args.dry_run)
+    else:
+        in_p = target
+        out_p = Path(args.output) if args.output else None
+        process_file(in_p, out_p, cfg, dry_run=args.dry_run)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
