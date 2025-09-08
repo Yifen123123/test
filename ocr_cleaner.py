@@ -131,10 +131,18 @@ def normalize_colons(s: str) -> str:
     return re.sub(r"[：﹕:]\s*", "：", s)
 
 def normalize_bullets(s: str) -> str:
-    s = re.sub(r"^[\*\•\·]\s*", "・", s)
-    s = re.sub(r"^(\d+)[\)\.] ", r"\1. ", s)
-    s = re.sub(r"^\((一|二|三|四|五|六|七|八|九|十)\)\s*", r"\1、", s)
+    # 條列符號與括號編號的正規化：
+    # •、*、· 開頭 → 統一成 '・'
+    s = re.sub(r'^[\*\•\·]\s*', '・', s)
+    # 1) 或 1. → 1. （確保後面有一個空白）
+    s = re.sub(r'^(\d+)[\)\.]\s?', r'\1. ', s)
+    # (1) / （1） → 1.
+    s = re.sub(r'^[\(（](\d+)[\)）]\s*', r'\1. ', s)
+    # (一) / （一） → 一、
+    s = re.sub(r'^[\(（](一|二|三|四|五|六|七|八|九|十)[\)）]\s*', r'\1、', s)
     return s
+
+
 
 def remove_header_footer(lines: List[str], level: int) -> List[str]:
     if len(lines) < 40:
