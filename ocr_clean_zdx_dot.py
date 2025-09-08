@@ -97,6 +97,21 @@ def cleanup_lines(t: str) -> str:
         cleaned.append(s)
     return "\n".join(cleaned)
 
+def remove_page_markers(t: str) -> str:
+    """
+    移除 OCR 掃描常見的頁碼標籤：
+    例如「第 1 頁 ， 共 2 頁」「第1頁,共10頁」「第 3 頁 共 5 頁」
+    """
+    lines = t.splitlines()
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+        # 符合「第X頁…共Y頁」模式就跳過
+        if re.match(r"^第\s*\d+\s*頁.*共\s*\d+\s*頁$", s):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned)
+
 def main():
     ap = argparse.ArgumentParser(description="刪除『裝』『訂』『線』、行首點串（. .. ...）、並清理空白/純標點行（純標準庫版）。")
     ap.add_argument("input", help="輸入 .txt 檔路徑")
@@ -120,8 +135,11 @@ def main():
 
     # 3) 清掉每行行首的點（. .. ...）
     t = remove_leading_dots(t)
+    
+    # 4) 移除頁碼標籤
+    t = remove_page_markers(t)
 
-    # 4) 移除空行與純標點/符號行
+    # 5) 移除空行與純標點/符號行
     t = cleanup_lines(t)
 
     out_path = Path(args.output) if args.output else in_path.with_suffix(".clean.txt")
