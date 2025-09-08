@@ -176,18 +176,38 @@ def sentence_split_zh(t: str) -> list:
 
 def basic_punct_fix(sents):
     """
-    規則式補標點：
-    - 若句尾沒有 。！？； → 補一個 。
-    - 將「主旨：」「說明：」「附件：」等段首，確保獨立一行。
+    規則式補標點（改良版 v2）：
+    - 不補在段首標題（主旨：/說明：…）
+    - 不補在冒號、括號、右引號結尾
+    - 不補在包含「身分證」「統一編號」的句子
+    - 不補在以「號/号」結尾的句子
+    - 其餘才補句號
     """
     fixed = []
     for s in sents:
+        s = s.strip()
+
+        # 段首標題直接保留
         if SECTION_HEAD_PAT.match(s):
             fixed.append(s if s.endswith('：') else s)
             continue
-        if not re.search(r'[。！？；!?]$', s):
-            s = s + '。'
-        fixed.append(s)
+
+        # 不補句號的情境
+        if s.endswith(("：", "）", "】", "」", "』")):
+            fixed.append(s)
+            continue
+        if "身分證" in s or "統一編號" in s:
+            fixed.append(s)
+            continue
+        if re.search(r"(號|号)$", s):
+            fixed.append(s)
+            continue
+
+        # 已以標點結尾就保留
+        if re.search(r'[。！？；!?]$', s):
+            fixed.append(s)
+        else:
+            fixed.append(s + "。")
     return fixed
 
 # -------------------- 主流程 --------------------
