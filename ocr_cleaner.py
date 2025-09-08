@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ocr_cleaner.py — 安全保守的 OCR .txt 清洗器（含你的預設規則）
+ocr_cleaner.py — 安全保守的 OCR .txt 清洗器（含你的預設規則 & 強化版條列/點梯處理）
+
 重點：
 - 保留欄位（發文日期、發文字號、主旨、說明、XXX 函…）
-- 僅移除雜訊點行、單獨一字的「裝 / 訂 / 線」、頁碼「第 1 頁，共 2 頁」
-- 不移除你想保留的亂碼行（例如：＄！...）
+- 移除雜訊點行、單獨一字（裝/訂/線）、頁碼「第 1 頁，共 2 頁」多變體
+- 清除行首的點梯（如「.. 主旨」→「主旨」）、刪除行內三連以上點梯
+- 不移除你要保留的亂碼（例如：＄！...）
 
 使用方式：
-1) 清洗單一檔案（輸出到 *_clean.txt）：
-   python ocr_cleaner.py input.txt
-
-2) 指定輸出：
-   python ocr_cleaner.py input.txt -o cleaned.txt
-
-3) 批次（遞迴）：
-   python ocr_cleaner.py /path/to/folder -r
-
-4) 預覽差異：
-   python ocr_cleaner.py input.txt --dry-run
-
-5) 清洗強度：
-   python ocr_cleaner.py input.txt --level light|medium|aggressive
-
-6) 自訂：
-   python ocr_cleaner.py input.txt --keep 主旨 說明 --ban "^\.*\s*$"
-
-注：預設 encoding='utf-8'，如需 big5/cp950，請加 --encoding cp950
+1) 單檔清洗：python ocr_cleaner.py input.txt
+2) 指定輸出：python ocr_cleaner.py input.txt -o cleaned.txt
+3) 資料夾遞迴：python ocr_cleaner.py data/raw/通知函 -r
+4) 預覽差異：python ocr_cleaner.py input.txt --dry-run
+5) 調整強度：--level light|medium|aggressive
+6) 追加白/黑名單：--keep 來文字號 --ban "^-{5,}$"
 """
 from __future__ import annotations
 import argparse
@@ -37,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Dict
 
-# ========= 常見 OCR 誤辨對映（保守套用） =========
+# ========== 數字型 token 的誤辨修正 ==========
 def _digitish(s: str) -> bool:
     t = re.sub(r"[,./\\\-:：﹕，、\s]", "", s)
     return t != "" and all(ch.isdigit() or ch.isascii() for ch in t)
@@ -46,41 +35,40 @@ def fix_numeric_confusions(token: str) -> str:
     if not token:
         return token
     if _digitish(token):
-        # 僅在「像數字」的 token 內轉換
         token = (token
             .replace("O","0").replace("I","1").replace("l","1")
             .replace("Z","2").replace("S","5").replace("B","8"))
     return token
 
-# ========= 必留欄位（白名單；遇到就保留該行） =========
+# ========== 白名單：遇到就保留 ==========
 DEFAULT_KEEP_KEYWORDS = [
     # 你特別要求的
     "函", "主旨", "電話", "聯絡電話", "聯絡方式", "附件", "地址", "承辦人", "傳真",
     "發文日期", "發文字號", "速別", "說明", "正本", "副本",
-    # 常見公文欄位（補強，避免漏掉）
+    # 常見公文欄位補強
     "受文者", "檔號", "保存年限", "保存期限", "受文單位", "受文機關", "案號", "字號",
     "發文機關", "承辦單位", "核稿", "會簽", "簽發", "來文", "來文字號", "收文日期",
     "機關地址", "機關電話", "頁次",
-    # 條列點（行首中文數序用 normalize_bullets 處理；這裡只作保守提示）
+    # 常見中文數序（條列）
     "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
 ]
 
-# ========= 必刪樣式（黑名單；但白名單優先） =========
+# ========== 黑名單：但白名單優先 ==========
 DEFAULT_BANNED_PATTERNS = [
-    r"^\s*$",                 # 空行
-    r"^[\.\·\•\*]{2,}\s*$",   # 多顆點/圓點/星號的雜訊行
-    r"^[\.\s]+$",             # 純點與空白
-    r"^(裝|訂|線)$",          # 單獨一字：裝 / 訂 / 線
-    r"^第\s*\d+\s*頁[，,]\s*共\s*\d+\s*頁$",  # 頁碼行（中/半形逗號皆可）
-    r"^[\-_]{3,}\s*$",        # 分隔線
+    r"^\s*$",                                 # 空行
+    r"^[\.\·\•\*]{2,}\s*$",                   # 多顆點/圓點/星號的雜訊行
+    r"^[\.\s]+$",                             # 純點與空白
+    r"^\s*(裝|訂|線)\s*$",                    # 單獨一字（裝/訂/線）行
+    r"^第\s*\d+\s*頁\s*[，,、]?\s*共\s*\d+\s*頁\s*$",  # 頁碼行（更寬鬆）
+    r"^[\-_]{3,}\s*$",                        # 分隔線
 ]
 
-# ========= 清洗等級 =========
 LEVELS = {"light": 0, "medium": 1, "aggressive": 2}
 
+# ========== 基本正規化 ==========
 def normalize_fullwidth(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"[ \t\u3000]+", " ", s)
+    s = unicodedata.normalize("NFKC", s)         # 全形→半形（不影響中文）
+    s = re.sub(r"[ \t\u3000]+", " ", s)          # 空白歸一
     return s.strip()
 
 def numeric_aware_fix(line: str) -> str:
@@ -104,6 +92,26 @@ def join_hard_wrapped_lines(lines: List[str]) -> List[str]:
         out.append(buf)
     return out
 
+def normalize_colons(s: str) -> str:
+    return re.sub(r"[：﹕:]\s*", "：", s)
+
+def remove_dot_noise_inline(s: str) -> str:
+    # 行首點梯（含空白）→ 去掉（例："..  主旨" → "主旨"）
+    s = re.sub(r'^(?:[\.\s]{1,})', '', s)
+    # 行內三連以上點梯 → 視為版面雜訊，移除並以單一空白替代
+    s = re.sub(r'(?:\s*\.\s*){3,}', ' ', s)
+    # 行尾兩連以上點梯 → 移除
+    s = re.sub(r'(?:\s*\.\s*){2,}$', '', s)
+    return s
+
+def normalize_bullets(s: str) -> str:
+    # 條列符號與括號編號正規化
+    s = re.sub(r'^[\*\•\·]\s*', '・', s)                 # • * · → ・
+    s = re.sub(r'^(\d+)[\)\.]\s?', r'\1. ', s)           # 1) / 1. → 1. 
+    s = re.sub(r'^[\(\（](\d+)[\)\）]\s*', r'\1. ', s)   # (1) / （1） → 1.
+    s = re.sub(r'^[\(\（](一|二|三|四|五|六|七|八|九|十)[\)\）]\s*', r'\1、', s)  # （一）→ 一、
+    return s
+
 def drop_noise_lines(lines: List[str], keep_keywords: List[str], banned_patterns: List[str], level: int) -> List[str]:
     out = []
     bans = [re.compile(p) for p in banned_patterns]
@@ -114,38 +122,21 @@ def drop_noise_lines(lines: List[str], keep_keywords: List[str], banned_patterns
             out.append(raw); continue
         if any(b.search(line) for b in bans):
             continue
-        # 極短英文殘塊（medium+），不含中文時才刪
+        # 極短英文殘塊（medium+），不含中文才刪
         if level >= 1:
             if len(line.strip()) <= 1 and not re.search(r"[\u4e00-\u9fff]", line):
                 continue
-        # 不做「純符號刪除」以保留像 ＄！... 之類的行（你的需求）
         out.append(raw)
     return out
 
 def collapse_dot_ladders(s: str) -> str:
+    # 合併多段點梯，再交由 remove_dot_noise_inline 做後續清理
     s = re.sub(r"(?:\.\s*){3,}", "...", s)
     s = s.replace("．．．", "…").replace("… …", "…")
     return s
 
-def normalize_colons(s: str) -> str:
-    return re.sub(r"[：﹕:]\s*", "：", s)
-
-def normalize_bullets(s: str) -> str:
-    # 條列符號與括號編號的正規化：
-    # •、*、· 開頭 → 統一成 '・'
-    s = re.sub(r'^[\*\•\·]\s*', '・', s)
-    # 1) 或 1. → 1. （確保後面有一個空白）
-    s = re.sub(r'^(\d+)[\)\.]\s?', r'\1. ', s)
-    # (1) / （1） → 1.
-    s = re.sub(r'^[\(（](\d+)[\)）]\s*', r'\1. ', s)
-    # (一) / （一） → 一、
-    s = re.sub(r'^[\(（](一|二|三|四|五|六|七|八|九|十)[\)）]\s*', r'\1、', s)
-    return s
-
-
-
 def remove_header_footer(lines: List[str], level: int) -> List[str]:
-    if len(lines) < 40:
+    if len(lines) < 40:  # 單頁不處理（避免誤殺）
         return lines
     freq: Dict[str, int] = {}
     for ln in lines:
@@ -163,8 +154,6 @@ def remove_header_footer(lines: List[str], level: int) -> List[str]:
             out.append(ln)
     return out
 
-from dataclasses import dataclass, field
-
 @dataclass
 class CleanerConfig:
     encoding: str = "utf-8"
@@ -173,21 +162,32 @@ class CleanerConfig:
     banned_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_BANNED_PATTERNS))
 
 def clean_text(content: str, cfg: CleanerConfig) -> str:
+    # 1) 基本正規化
     content = normalize_fullwidth(content)
     lines = content.splitlines()
+
+    # 2) 版面級處理
     lines = remove_header_footer(lines, cfg.level)
     lines = join_hard_wrapped_lines(lines)
+
+    # 3) 先清掉會擋住白名單偵測的點梯雜訊
+    lines = [remove_dot_noise_inline(ln) for ln in lines]
+
+    # 4) 行級刪除（白名單優先）
     lines = drop_noise_lines(lines, cfg.keep_keywords, cfg.banned_patterns, cfg.level)
 
+    # 5) 行內微清洗
     cleaned_lines = []
     for ln in lines:
         s = ln.rstrip("\n")
         s = normalize_colons(s)
         s = collapse_dot_ladders(s)
+        s = remove_dot_noise_inline(s)
         s = numeric_aware_fix(s)
         s = normalize_bullets(s)
         cleaned_lines.append(s.strip())
 
+    # 6) 相鄰重複行壓縮（白名單行不壓）
     final_lines, prev = [], None
     for s in cleaned_lines:
         if s and s == prev and not any(kw in s for kw in cfg.keep_keywords):
@@ -195,6 +195,7 @@ def clean_text(content: str, cfg: CleanerConfig) -> str:
         final_lines.append(s); prev = s
     return "\n".join(final_lines).strip() + "\n"
 
+# ========== 檔案 I/O ==========
 def read_text(path: Path, encoding: str) -> str:
     with path.open("r", encoding=encoding, errors="ignore") as f:
         return f.read()
@@ -208,11 +209,11 @@ def process_file(in_path: Path, out_path: Path|None, cfg: CleanerConfig, dry_run
     raw = read_text(in_path, cfg.encoding)
     cleaned = clean_text(raw, cfg)
     if dry_run:
-        import difflib, sys
+        import difflib
         diff = difflib.unified_diff(
             raw.splitlines(), cleaned.splitlines(),
             fromfile=str(in_path),
-            tofile=str(out_path or (in_path.with_suffix('') .name + '_clean.txt')),
+            tofile=str(out_path or (in_path.with_suffix('').name + '_clean.txt')),
             lineterm=''
         )
         sys.stdout.write("\n".join(diff) + "\n")
@@ -228,6 +229,7 @@ def walk_and_process(root: Path, cfg: CleanerConfig, dry_run: bool=False):
         out_p = root.parent / ("cleaned_" + root.name) / rel
         process_file(p, out_p, cfg, dry_run=dry_run)
 
+# ========== CLI ==========
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="保守的 OCR .txt 清洗器（保留欄位、不洗壞）")
     ap.add_argument("path", help=".txt 檔或資料夾")
@@ -244,19 +246,4 @@ def main(argv=None):
     args = parse_args(argv)
     target = Path(args.path)
     cfg = CleanerConfig(encoding=args.encoding, level=LEVELS[args.level])
-    if args.keep: cfg.keep_keywords.extend(args.keep)
-    if args.ban:  cfg.banned_patterns.extend(args.ban)
-
-    if target.is_dir():
-        if not args.recursive:
-            print("提示：你提供的是資料夾。若要遞迴處理請加上 -r / --recursive")
-            return 0
-        walk_and_process(target, cfg, dry_run=args.dry_run)
-    else:
-        in_p = target
-        out_p = Path(args.output) if args.output else None
-        process_file(in_p, out_p, cfg, dry_run=args.dry_run)
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if args.keep: cfg.keep_keywords.extend(_
