@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import List, Tuple, Iterable
 import numpy as np
+from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter
 
 # =========================
@@ -11,6 +12,7 @@ INPUT_DIR   = Path("create_image_5")
 OUT_BRIGHT  = Path("create_test_image/bright")
 OUT_ROTATE  = Path("create_test_image/rotate")
 OUT_NOISE   = Path("create_test_image/impurities")
+OUT_DEGRADE = Path("create_test_image/degrade")
 
 # 亮度（<1 變暗；>1 變亮）
 BRIGHT_FACTORS: List[float] = [0.9, 0.8, 0.6, 1.1, 1.2, 1.4]
@@ -25,15 +27,24 @@ ROTATE_BG = (255, 255, 255)
 NOISE_RATIOS: Iterable[Tuple[int, int]] = [(1, 3), (1, 1), (3, 1)]
 
 # 雜訊密度：全圖中「種子點」比例（0.02=2%）
-# 自然模式會將這些種子模糊成小斑點，實際受影響像素會略大於 density
 NOISE_DENSITY = 0.02
 
 # 雜訊外觀控制（可微調讓更自然）
-NOISE_BLUR_RADIUS_RANGE = (0.6, 1.8)   # 小斑點模糊半徑範圍（像素）
-NOISE_ALPHA_THRESHOLD_RANGE = (0.2, 0.6)  # 斑點成形門檻（越低→越大片）
-NOISE_ALPHA_STRENGTH = 1.0  # 0~1，整體透明度縮放（<1 會更輕微、更自然）
+NOISE_BLUR_RADIUS_RANGE = (0.6, 1.8)      # 斑點模糊半徑（像素）
+NOISE_ALPHA_THRESHOLD_RANGE = (0.2, 0.6)  # 斑點成形門檻
+NOISE_ALPHA_STRENGTH = 1.0                # 0~1，整體透明度縮放
 
-# 若想結果可重現，設固定亂數種子
+# 畫質降低參數（可多組一起輸出）
+# 1) JPEG 壓縮品質：數值越低失真越重（1~95）
+JPEG_QUALITIES: List[int] = [35, 25, 15]
+
+# 2) 解析度降低：先縮小 scale 再放回原尺寸
+DOWNSCALE_FACTORS: List[float] = [0.7, 0.5, 0.35]  # 0.35 ≈ 35%
+
+# 3) 模糊強度（Gaussian blur 半徑）
+BLUR_RADII: List[float] = [0.8, 1.2, 1.8]
+
+# 若想結果可重現，設固定亂數種子（None 表示每次不同）
 RANDOM_SEED: int | None = None
 
 
@@ -74,24 +85,19 @@ def _generate_blob_alpha_mask(h: int, w: int, seeds_rc: np.ndarray,
     由「種子點」生成柔邊小斑點的 alpha mask（0~1）。
     流程：二值種子 → 高斯模糊 → 門檻化 → 線性拉伸成柔邊 alpha。
     """
-    # 建立種子圖（L）
-    seed_img = Image.fromarray(np.zeros((h, w), dtype=np.uint8), mode="L")
-    # 將種子點位置設為 255
-    arr = np.array(seed_img)
-    rows, cols = seeds_rc[:, 0], seeds_rc[:, 1]
-    arr[rows, cols] = 255
-    seed_img = Image.fromarray(arr, mode="L")
+    base = np.zeros((h, w), dtype=np.uint8)
+    if len(seeds_rc) > 0:
+        rows, cols = seeds_rc[:, 0], seeds_rc[:, 1]
+        base[rows, cols] = 255
+    seed_img = Image.fromarray(base, mode="L")
 
-    # 模糊形成小團塊
     blurred = seed_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     mask = np.asarray(blurred, dtype=np.float32) / 255.0
 
-    # 轉成柔邊 alpha：>threshold 的部分映射為 (mask - thr)/(1 - thr)
     thr = np.clip(threshold, 0.0, 0.95)
     alpha = (mask - thr) / max(1e-6, (1.0 - thr))
     alpha = np.clip(alpha, 0.0, 1.0)
 
-    # 整體透明度縮放（讓雜點更自然、不要過白/過黑）
     if NOISE_ALPHA_STRENGTH != 1.0:
         alpha *= float(NOISE_ALPHA_STRENGTH)
 
@@ -99,19 +105,16 @@ def _generate_blob_alpha_mask(h: int, w: int, seeds_rc: np.ndarray,
 
 def add_salt_pepper_natural(img: Image.Image, density: float, salt_ratio: float) -> Image.Image:
     """
-    以「自然」方式加入鹽椒：
-    1) 隨機產生 salt/pepper 種子點（依 density 與比例）
-    2) 高斯模糊成小斑點並建立『柔邊 alpha mask』
-    3) 以 alpha 與白/黑混合（而非硬覆蓋），模擬紙屑/灰塵/掃描點狀
-
-    備註：這種方式比單點 255/0 自然許多，也更像實際掃描偽影。
+    以自然方式加入鹽椒：
+    - 種子點（依 density/salt_ratio）
+    - 高斯模糊形成斑點（柔邊 alpha）
+    - 以 alpha 與白/黑做線性混合
     """
     rgb = img.convert("RGB")
     arr = np.asarray(rgb).astype(np.float32)
     h, w, _ = arr.shape
     total_pixels = h * w
 
-    # 計算種子數量
     n_seeds = int(total_pixels * max(0.0, min(1.0, density)))
     if n_seeds <= 0:
         return rgb
@@ -119,19 +122,12 @@ def add_salt_pepper_natural(img: Image.Image, density: float, salt_ratio: float)
     n_salt = int(n_seeds * salt_ratio)
     n_pepper = n_seeds - n_salt
 
-    # 產生隨機種子位置
-    if n_seeds > 0:
-        flat_idx = np.random.choice(total_pixels, size=n_seeds, replace=False)
-        seed_rows, seed_cols = np.divmod(flat_idx, w)
+    flat_idx = np.random.choice(total_pixels, size=n_seeds, replace=False)
+    rows, cols = np.divmod(flat_idx, w)
+    salt_rc = np.stack([rows[:n_salt], cols[:n_salt]], axis=1) if n_salt > 0 else np.zeros((0,2), int)
+    pep_rc  = np.stack([rows[n_salt:], cols[n_salt:]], axis=1) if n_pepper > 0 else np.zeros((0,2), int)
 
-        # 拆成 salt / pepper
-        salt_rc = np.stack([seed_rows[:n_salt], seed_cols[:n_salt]], axis=1) if n_salt > 0 else np.zeros((0,2), int)
-        pep_rc  = np.stack([seed_rows[n_salt:], seed_cols[n_salt:]], axis=1) if n_pepper > 0 else np.zeros((0,2), int)
-    else:
-        salt_rc = np.zeros((0,2), int)
-        pep_rc  = np.zeros((0,2), int)
-
-    # 生成兩種斑點 alpha（鹽與椒用不同參數，增加隨機性）
+    # 兩種斑點用不同隨機參數
     if len(salt_rc) > 0:
         br_s = _rand_uniform(*NOISE_BLUR_RADIUS_RANGE)
         th_s = _rand_uniform(*NOISE_ALPHA_THRESHOLD_RANGE)
@@ -146,18 +142,45 @@ def add_salt_pepper_natural(img: Image.Image, density: float, salt_ratio: float)
     else:
         alpha_pep = np.zeros((h, w), dtype=np.float32)
 
-    # 先加「椒」（變暗），再加「鹽」（變亮）
-    # arr := (1 - a) * arr + a * target
+    # 先加「椒」（暗），再加「鹽」（亮）
     if np.any(alpha_pep > 0):
-        a = alpha_pep[..., None]  # HxWx1
-        arr = (1.0 - a) * arr + a * 0.0  # toward black
+        a = alpha_pep[..., None]
+        arr = (1.0 - a) * arr + a * 0.0
 
     if np.any(alpha_salt > 0):
         a = alpha_salt[..., None]
-        arr = (1.0 - a) * arr + a * 255.0  # toward white
+        arr = (1.0 - a) * arr + a * 255.0
 
     arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
     return Image.fromarray(arr, mode="RGB")
+
+# ---- 畫質降低（degrade）方法 ----
+def degrade_jpeg_quality(img: Image.Image, quality: int = 30) -> Image.Image:
+    """
+    低品質 JPEG 再讀回，模擬壓縮失真。
+    quality: 1~95（數字越低失真越多）
+    """
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=int(quality), optimize=False)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+def degrade_resolution(img: Image.Image, scale: float = 0.5) -> Image.Image:
+    """
+    解析度降低：先縮小再放大回原尺寸。
+    """
+    scale = float(scale)
+    w, h = img.size
+    w2 = max(1, int(w * scale))
+    h2 = max(1, int(h * scale))
+    small = img.resize((w2, h2), Image.BILINEAR)
+    return small.resize((w, h), Image.BICUBIC)
+
+def degrade_blur(img: Image.Image, radius: float = 1.2) -> Image.Image:
+    """
+    模糊：Gaussian blur 半徑愈大愈糊。
+    """
+    return img.filter(ImageFilter.GaussianBlur(radius))
 
 
 # =========================
@@ -167,7 +190,7 @@ def main():
     if RANDOM_SEED is not None:
         np.random.seed(RANDOM_SEED)
 
-    ensure_dirs(OUT_BRIGHT, OUT_ROTATE, OUT_NOISE)
+    ensure_dirs(OUT_BRIGHT, OUT_ROTATE, OUT_NOISE, OUT_DEGRADE)
 
     files = sorted(INPUT_DIR.glob("*.png"))
     if not files:
@@ -178,7 +201,7 @@ def main():
 
     for p in files:
         stem = p.stem
-        img = Image.open(p)
+        img = Image.open(p).convert("RGB")
 
         # 1) 亮度（同時輸出變暗與變亮版本）
         for f in BRIGHT_FACTORS:
@@ -198,17 +221,30 @@ def main():
             total = salt + pepper
             salt_ratio = salt / total
             out = add_salt_pepper_natural(img, density=NOISE_DENSITY, salt_ratio=salt_ratio)
-            save_png(
-                out,
-                OUT_NOISE,
-                stem,
-                f"_sp{salt}-{pepper}_nat_d{int(NOISE_DENSITY*100)}p"
-            )
+            save_png(out, OUT_NOISE, stem, f"_sp{salt}-{pepper}_nat_d{int(NOISE_DENSITY*100)}p")
+
+        # 4) 畫質降低（各種方式）
+        #    (a) JPEG 壓縮
+        for q in JPEG_QUALITIES:
+            out = degrade_jpeg_quality(img, quality=q)
+            save_png(out, OUT_DEGRADE, stem, f"_jpegQ{q}")
+
+        #    (b) 解析度下降
+        for s in DOWNSCALE_FACTORS:
+            out = degrade_resolution(img, scale=s)
+            save_png(out, OUT_DEGRADE, stem, f"_res{int(s*100)}")
+
+        #    (c) 模糊
+        for r in BLUR_RADII:
+            out = degrade_blur(img, radius=r)
+            # 半徑用小數一位比較直覺
+            save_png(out, OUT_DEGRADE, stem, f"_blur{r:.1f}")
 
     print("✅ 完成！")
     print(f"亮度輸出：   {OUT_BRIGHT.resolve()}")
     print(f"旋轉輸出：   {OUT_ROTATE.resolve()}")
     print(f"雜訊輸出：   {OUT_NOISE.resolve()}")
+    print(f"畫質降低輸出：{OUT_DEGRADE.resolve()}")
 
 
 if __name__ == "__main__":
