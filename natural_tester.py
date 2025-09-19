@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import List, Tuple, Iterable
 import numpy as np
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 
 # =========================
 # 可調整參數
@@ -12,8 +12,7 @@ OUT_BRIGHT  = Path("create_test_image/bright")
 OUT_ROTATE  = Path("create_test_image/rotate")
 OUT_NOISE   = Path("create_test_image/impurities")
 
-# 亮度調整（<1 變暗；>1 變亮）
-# 例如只要變暗可改成 [0.9, 0.8, 0.6]；只要變亮改成 [1.1, 1.2, 1.4]
+# 亮度（<1 變暗；>1 變亮）
 BRIGHT_FACTORS: List[float] = [0.9, 0.8, 0.6, 1.1, 1.2, 1.4]
 
 # 更貼近人為掃描的小歪斜（度）
@@ -22,13 +21,19 @@ ROTATE_DEGREES: List[float] = [-1.0, 0.8, 1.5]
 # 旋轉背景色（避免四角出現黑邊）
 ROTATE_BG = (255, 255, 255)
 
-# 鹽椒雜訊比例（salt:pepper）
+# 自然鹽椒雜訊：比例（salt:pepper）
 NOISE_RATIOS: Iterable[Tuple[int, int]] = [(1, 3), (1, 1), (3, 1)]
 
-# 雜訊密度（整張圖中有多少比例像素被改成鹽/椒；0.02 = 2%）
+# 雜訊密度：全圖中「種子點」比例（0.02=2%）
+# 自然模式會將這些種子模糊成小斑點，實際受影響像素會略大於 density
 NOISE_DENSITY = 0.02
 
-# 若想結果可重現，可設定亂數種子（None 表示每次不同）
+# 雜訊外觀控制（可微調讓更自然）
+NOISE_BLUR_RADIUS_RANGE = (0.6, 1.8)   # 小斑點模糊半徑範圍（像素）
+NOISE_ALPHA_THRESHOLD_RANGE = (0.2, 0.6)  # 斑點成形門檻（越低→越大片）
+NOISE_ALPHA_STRENGTH = 1.0  # 0~1，整體透明度縮放（<1 會更輕微、更自然）
+
+# 若想結果可重現，設固定亂數種子
 RANDOM_SEED: int | None = None
 
 
@@ -60,35 +65,99 @@ def rotate_human_skew(img: Image.Image, degrees: float) -> Image.Image:
         composed = Image.alpha_composite(bg, rgba)
         return composed.convert("RGB")
 
-def add_salt_pepper(img: Image.Image, density: float, salt_ratio: float) -> Image.Image:
+def _rand_uniform(a: float, b: float) -> float:
+    return float(np.random.uniform(a, b))
+
+def _generate_blob_alpha_mask(h: int, w: int, seeds_rc: np.ndarray,
+                              blur_radius: float, threshold: float) -> np.ndarray:
     """
-    對 RGB 影像加入鹽椒雜訊。
-    density:  0~1，總雜訊像素比例（越大越吵）
-    salt_ratio: 在雜訊像素中，鹽（白）的比例；椒（黑）比例 = 1 - salt_ratio
+    由「種子點」生成柔邊小斑點的 alpha mask（0~1）。
+    流程：二值種子 → 高斯模糊 → 門檻化 → 線性拉伸成柔邊 alpha。
+    """
+    # 建立種子圖（L）
+    seed_img = Image.fromarray(np.zeros((h, w), dtype=np.uint8), mode="L")
+    # 將種子點位置設為 255
+    arr = np.array(seed_img)
+    rows, cols = seeds_rc[:, 0], seeds_rc[:, 1]
+    arr[rows, cols] = 255
+    seed_img = Image.fromarray(arr, mode="L")
+
+    # 模糊形成小團塊
+    blurred = seed_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    mask = np.asarray(blurred, dtype=np.float32) / 255.0
+
+    # 轉成柔邊 alpha：>threshold 的部分映射為 (mask - thr)/(1 - thr)
+    thr = np.clip(threshold, 0.0, 0.95)
+    alpha = (mask - thr) / max(1e-6, (1.0 - thr))
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    # 整體透明度縮放（讓雜點更自然、不要過白/過黑）
+    if NOISE_ALPHA_STRENGTH != 1.0:
+        alpha *= float(NOISE_ALPHA_STRENGTH)
+
+    return alpha  # HxW, float32, [0,1]
+
+def add_salt_pepper_natural(img: Image.Image, density: float, salt_ratio: float) -> Image.Image:
+    """
+    以「自然」方式加入鹽椒：
+    1) 隨機產生 salt/pepper 種子點（依 density 與比例）
+    2) 高斯模糊成小斑點並建立『柔邊 alpha mask』
+    3) 以 alpha 與白/黑混合（而非硬覆蓋），模擬紙屑/灰塵/掃描點狀
+
+    備註：這種方式比單點 255/0 自然許多，也更像實際掃描偽影。
     """
     rgb = img.convert("RGB")
-    arr = np.array(rgb)
+    arr = np.asarray(rgb).astype(np.float32)
     h, w, _ = arr.shape
     total_pixels = h * w
-    n_noisy = int(total_pixels * density)
-    if n_noisy <= 0:
+
+    # 計算種子數量
+    n_seeds = int(total_pixels * max(0.0, min(1.0, density)))
+    if n_seeds <= 0:
         return rgb
 
-    # 亂數索引
-    flat_indices = np.random.choice(total_pixels, size=n_noisy, replace=False)
-    n_salt = int(n_noisy * salt_ratio)
-    salt_idx = flat_indices[:n_salt]
-    pepper_idx = flat_indices[n_salt:]
+    n_salt = int(n_seeds * salt_ratio)
+    n_pepper = n_seeds - n_salt
 
-    # 映射回 (row, col)
-    salt_rows, salt_cols = np.divmod(salt_idx, w)
-    pep_rows, pep_cols   = np.divmod(pepper_idx, w)
+    # 產生隨機種子位置
+    if n_seeds > 0:
+        flat_idx = np.random.choice(total_pixels, size=n_seeds, replace=False)
+        seed_rows, seed_cols = np.divmod(flat_idx, w)
 
-    # 寫入白/黑
-    arr[salt_rows,  salt_cols] = [255, 255, 255]
-    arr[pep_rows,   pep_cols]  = [0, 0, 0]
+        # 拆成 salt / pepper
+        salt_rc = np.stack([seed_rows[:n_salt], seed_cols[:n_salt]], axis=1) if n_salt > 0 else np.zeros((0,2), int)
+        pep_rc  = np.stack([seed_rows[n_salt:], seed_cols[n_salt:]], axis=1) if n_pepper > 0 else np.zeros((0,2), int)
+    else:
+        salt_rc = np.zeros((0,2), int)
+        pep_rc  = np.zeros((0,2), int)
 
-    return Image.fromarray(arr)
+    # 生成兩種斑點 alpha（鹽與椒用不同參數，增加隨機性）
+    if len(salt_rc) > 0:
+        br_s = _rand_uniform(*NOISE_BLUR_RADIUS_RANGE)
+        th_s = _rand_uniform(*NOISE_ALPHA_THRESHOLD_RANGE)
+        alpha_salt = _generate_blob_alpha_mask(h, w, salt_rc, br_s, th_s)
+    else:
+        alpha_salt = np.zeros((h, w), dtype=np.float32)
+
+    if len(pep_rc) > 0:
+        br_p = _rand_uniform(*NOISE_BLUR_RADIUS_RANGE)
+        th_p = _rand_uniform(*NOISE_ALPHA_THRESHOLD_RANGE)
+        alpha_pep = _generate_blob_alpha_mask(h, w, pep_rc, br_p, th_p)
+    else:
+        alpha_pep = np.zeros((h, w), dtype=np.float32)
+
+    # 先加「椒」（變暗），再加「鹽」（變亮）
+    # arr := (1 - a) * arr + a * target
+    if np.any(alpha_pep > 0):
+        a = alpha_pep[..., None]  # HxWx1
+        arr = (1.0 - a) * arr + a * 0.0  # toward black
+
+    if np.any(alpha_salt > 0):
+        a = alpha_salt[..., None]
+        arr = (1.0 - a) * arr + a * 255.0  # toward white
+
+    arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
 
 
 # =========================
@@ -124,17 +193,16 @@ def main():
             sign = "+" if deg >= 0 else ""
             save_png(out, OUT_ROTATE, stem, f"_r{sign}{deg:.1f}deg")
 
-        # 3) 鹽椒雜訊（不同 salt:pepper 比例）
+        # 3) 自然鹽椒雜訊
         for salt, pepper in NOISE_RATIOS:
             total = salt + pepper
             salt_ratio = salt / total
-            out = add_salt_pepper(img, density=NOISE_DENSITY, salt_ratio=salt_ratio)
-            # 檔名例：_sp1-3_d2p（1:3，密度 2%）
+            out = add_salt_pepper_natural(img, density=NOISE_DENSITY, salt_ratio=salt_ratio)
             save_png(
                 out,
                 OUT_NOISE,
                 stem,
-                f"_sp{salt}-{pepper}_d{int(NOISE_DENSITY*100)}p"
+                f"_sp{salt}-{pepper}_nat_d{int(NOISE_DENSITY*100)}p"
             )
 
     print("✅ 完成！")
