@@ -1,14 +1,14 @@
 import os
 import json
 import ast
-import re
-from typing import List, Tuple, Dict, Literal
+from typing import List, Tuple, Dict
 from PIL import Image, ImageDraw, ImageFont
 
 
-# =========================
-# 1) 讀 positions.txt
-# =========================
+# =====================================================
+# 1) 讀取 positions.txt
+#    格式：[[[x1,y1],[x2,y2]], [[x1,y1],[x2,y2]], ...]
+# =====================================================
 def load_table_boxes(position_path: str) -> List[Tuple[int, int, int, int]]:
     with open(position_path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
@@ -16,7 +16,7 @@ def load_table_boxes(position_path: str) -> List[Tuple[int, int, int, int]]:
     data = ast.literal_eval(raw)
 
     boxes = []
-    for i, box in enumerate(data, start=1):
+    for box in data:
         (x1, y1), (x2, y2) = box
         x1, x2 = sorted((int(x1), int(x2)))
         y1, y2 = sorted((int(y1), int(y2)))
@@ -28,16 +28,16 @@ def load_table_boxes(position_path: str) -> List[Tuple[int, int, int, int]]:
     return boxes
 
 
-# =========================
-# 2) 字型
-# =========================
+# =====================================================
+# 2) 字型載入
+# =====================================================
 def load_font(font_path: str, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(font_path, size=size)
 
 
-# =========================
-# 3) 換行
-# =========================
+# =====================================================
+# 3) 只做「換行」，不縮字
+# =====================================================
 def wrap_plain_by_pixel(draw, text, font, max_width):
     lines = []
     for para in text.split("\n"):
@@ -53,89 +53,82 @@ def wrap_plain_by_pixel(draw, text, font, max_width):
     return lines
 
 
-# =========================
-# 4) 自動縮字
-# =========================
-def fit_text_to_box(draw, text, box, font_path,
-                    max_font_size=22, min_font_size=12,
-                    line_spacing_ratio=0.2, padding=4):
+# =====================================================
+# 4) 表格專用：固定字體大小畫字
+# =====================================================
+def draw_text_in_table_cell(
+    draw,
+    text,
+    box,
+    font_path,
+    font_size=18,          # ⭐ 固定字級
+    halign="left",         # left / center / right
+    valign="center",       # center / top
+    padding=4,
+    fill=(0, 0, 0),
+):
+    font = load_font(font_path, font_size)
 
     x1, y1, x2, y2 = box
     max_w = (x2 - x1) - padding * 2
     max_h = (y2 - y1) - padding * 2
 
-    for size in range(max_font_size, min_font_size - 1, -1):
-        font = load_font(font_path, size)
-        line_spacing = int(size * line_spacing_ratio)
-        lines = wrap_plain_by_pixel(draw, text, font, max_w)
+    lines = wrap_plain_by_pixel(draw, text, font, max_w)
+    line_spacing = int(font_size * 0.2)
 
-        total_h = sum(
-            draw.textbbox((0, 0), ln, font=font)[3]
-            for ln in lines
-        ) + line_spacing * (len(lines) - 1)
-
-        if total_h <= max_h:
-            return font, lines, line_spacing, padding
-
-    font = load_font(font_path, min_font_size)
-    return font, [text], int(min_font_size * line_spacing_ratio), padding
-
-
-# =========================
-# 5) 畫文字（支援左右置中）
-# =========================
-def draw_text_in_box(draw, text, box, font_path,
-                     halign="left", valign="center",
-                     max_font_size=22, padding=4):
-
-    font, lines, line_spacing, padding = fit_text_to_box(
-        draw, text, box, font_path, max_font_size=max_font_size, padding=padding
-    )
-
-    x1, y1, x2, y2 = box
-    content_w = (x2 - x1) - padding * 2
-    content_h = (y2 - y1) - padding * 2
-
+    # 計算高度，超出就截斷
     heights = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
-    widths = [draw.textbbox((0, 0), ln, font=font)[2] for ln in lines]
     total_h = sum(heights) + line_spacing * (len(lines) - 1)
 
-    y = y1 + padding + (content_h - total_h) // 2
+    while total_h > max_h and lines:
+        lines.pop()
+        heights.pop()
+        total_h = sum(heights) + line_spacing * (len(lines) - 1)
 
-    for ln, h, w in zip(lines, heights, widths):
+    # 垂直起點
+    if valign == "center":
+        y = y1 + padding + max(0, (max_h - total_h) // 2)
+    else:
+        y = y1 + padding
+
+    # 逐行畫
+    for ln, h in zip(lines, heights):
+        w = draw.textbbox((0, 0), ln, font=font)[2]
+
         if halign == "left":
             x = x1 + padding
         elif halign == "center":
-            x = x1 + padding + (content_w - w) // 2
-        else:
+            x = x1 + padding + max(0, (max_w - w) // 2)
+        else:  # right
             x = x2 - padding - w
 
-        draw.text((x, y), ln, font=font, fill=(0, 0, 0))
+        draw.text((x, y), ln, font=font, fill=fill)
         y += h + line_spacing
 
 
-# =========================
-# 6) 攤平調查人資料
-# =========================
+# =====================================================
+# 5) 攤平成表格順序（5 人 × 3 欄）
+# =====================================================
 def flatten_investigators_for_table(investigators: List[Dict[str, str]]) -> List[str]:
     result = []
     for p in investigators:
-        result.append(p["姓名"])
-        result.append(p["身分證字號"])
-        result.append(p["財產基準日"])
+        result.append(p.get("姓名", ""))
+        result.append(p.get("身分證字號", ""))
+        result.append(p.get("財產基準日", ""))
     return result
 
 
-# =========================
-# 7) 主流程：讀 JSON → 每案輸出一張圖
-# =========================
+# =====================================================
+# 6) 主流程：讀 JSON → 每案輸出一張圖
+# =====================================================
 def main():
     image_path = "official_documents/parameter/data_001_whiteout.png"
     position_path = "official_documents/parameter/investigators_table_positions.txt"
     json_path = "investigators.json"
     output_dir = "create_image_doc"
 
-    font_path = r"C:\Windows\Fonts\kaiu.ttf"
+    font_path = r"C:\Windows\Fonts\kaiu.ttf"  # Windows 標楷體
+    font_size = 18                            # ⭐ 表格統一字級
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -149,7 +142,7 @@ def main():
         texts = flatten_investigators_for_table(investigators)
 
         if len(texts) != len(table_boxes):
-            raise ValueError("調查人資料數量與表格框數量不一致")
+            raise ValueError("表格框數量與調查人資料數量不一致")
 
         img = Image.open(image_path).convert("RGBA")
         draw = ImageDraw.Draw(img)
@@ -158,13 +151,14 @@ def main():
             col = i % 3
             halign = ["left", "center", "right"][col]
 
-            draw_text_in_box(
+            draw_text_in_table_cell(
                 draw=draw,
                 text=text,
                 box=box,
                 font_path=font_path,
+                font_size=font_size,   # ⭐ 全表格一致
                 halign=halign,
-                max_font_size=22,
+                valign="center",
                 padding=4,
             )
 
