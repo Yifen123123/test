@@ -91,17 +91,31 @@ def main():
     answer = load_answer(Path(args.answer))
 
     rows = []
+
     for p in sorted(Path(args.pred_dir).glob("*.json")):
         model, time_str, pred = parse_pred(p)
+    
         mismatch, total_fields = evaluate(answer, pred)
-        acc = 0.0 if total_fields == 0 else 1 - mismatch / total_fields
-        rows.append((mismatch, model, acc, time_str))
-
-    rows.sort(key=lambda x: x[0])  # mismatch 越少越好
-
-    for mismatch, model, acc, time_str in rows:
-        print(f"{model:<18} | mismatch={mismatch}/{len(answer)*len(FIELDS)} | acc={acc:.3f} | time={time_str}")
-
+        acc = 1 - mismatch / total_fields
+    
+        rows.append({
+            "model": model,
+            "acc": acc,
+            "time_str": time_str
+        })
+    
+    # 依正確率排序
+    rows.sort(key=lambda r: r["acc"], reverse=True)
+    
+    # terminal 輸出
+    for r in rows:
+        print(
+            f"{r['model']:<18} | acc={r['acc']:.3f} | time={r['time_str']}"
+        )
+    
+    # 一次寫入 metrics.json
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
     main()
