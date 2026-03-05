@@ -9,7 +9,22 @@ from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-import matplotlib.colors as mcolors
+
+
+def to_halfwidth(s: str) -> str:
+    """把全形英數符號轉半形，避免像 'Ｂ' 這種字型缺字。"""
+    out = []
+    for ch in s:
+        code = ord(ch)
+        # 全形空白
+        if code == 0x3000:
+            out.append(" ")
+        # 全形 ASCII 範圍：！(FF01) ~ ～(FF5E)
+        elif 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - 0xFEE0))
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def parse_time_seconds(time_str: str) -> int:
@@ -22,58 +37,47 @@ def parse_time_seconds(time_str: str) -> int:
 def parse_family_and_size(model: str) -> Tuple[str, float]:
     """
     支援：
-      qwen2.5:3b
-      qwen2.5-7b
-      llama3:8b
-      phi-3-mini (抓不到 b 就 size=0)
+      qwen2.5:3b / qwen2.5-7b / llama3:8b / ...
+    抓不到 b 則 size=0，family=整串
     """
-    s = (model or "").strip()
-    low = s.lower()
-
-    # 抓結尾的 "3b" / "7b" / "13b" / "1.7b" 等
-    m = re.search(r"(.+?)[\s:_-]*([0-9]+(?:\.[0-9]+)?)b\b", low)
+    s = (model or "").strip().lower()
+    m = re.search(r"(.+?)[\s:_-]*([0-9]+(?:\.[0-9]+)?)b\b", s)
     if m:
-        family = m.group(1).strip(" :_-")
+        family = m.group(1).strip(" :_-") or "unknown"
         size = float(m.group(2))
         return family, size
-
-    # 抓不到 b：整串當 family，size=0（會用固定深度）
-    return low, 0.0
+    return (s or "unknown"), 0.0
 
 
-def shade_color(base_rgba, t: float):
-    """
-    t in [0,1]：越大越深
-    用「混黑」方式：t 越大 -> 越靠近原色；t 越小 -> 越淡
-    """
+def shade(base_rgba, t: float):
+    """t in [0,1]：越大越深；用『混白』做淡色，視覺更舒服。"""
     r, g, b, a = base_rgba
-    # 淡色比例：小模型更淡，大模型更接近原色
-    # 0.35~1.00
-    w = 0.35 + 0.65 * t
-    return (r * w, g * w, b * w, a)
+    # 混白：t 小 -> 更淡；t 大 -> 更接近原色
+    w = 1.0 - (0.65 * t)  # 0.35~1.0
+    return (r * (1 - w) + 1 * w, g * (1 - w) + 1 * w, b * (1 - w) + 1 * w, a)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--metrics", default="metrics.json", help="evaluator 產生的 metrics.json")
-    ap.add_argument("--out", default="acc_vs_time.png", help="輸出圖片檔名")
-    ap.add_argument("--title", default="Accuracy vs Execution Time", help="圖表標題")
+    ap.add_argument("--metrics", default="metrics.json")
+    ap.add_argument("--out", default="acc_vs_time.png")
+    ap.add_argument("--title", default="Accuracy vs Execution Time")
     args = ap.parse_args()
 
     rows: List[Dict[str, Any]] = json.loads(Path(args.metrics).read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
         raise ValueError("metrics.json 必須是非空 list")
 
-    # 準備資料
+    # 準備資料（同時做全形->半形）
     models: List[str] = []
     accs: List[float] = []
     secs: List[int] = []
-
     families: List[str] = []
     sizes: List[float] = []
 
     for r in rows:
-        model = str(r["model"])
+        model_raw = str(r["model"])
+        model = to_halfwidth(model_raw)  # ✅ 修正 _Ｂ 類型缺字
         acc = float(r["acc"])
         sec = int(r.get("time_seconds") or parse_time_seconds(str(r.get("time_str", ""))))
 
@@ -85,35 +89,32 @@ def main():
         families.append(fam)
         sizes.append(sz)
 
-    # 讓顏色穩定：family 依字典序固定映射 tab10
+    # family 顏色：固定、穩定
     uniq_fams = sorted(set(families))
     fam_to_idx = {f: i for i, f in enumerate(uniq_fams)}
     base_cmap = cm.get_cmap("tab10")
 
-    # 為了深淺合理：同 family 的 size 做 min-max normalize（若全是 0 就固定 0.7）
+    # 同 family 的 size 做 min-max normalize（若沒有 size 資訊就固定 0.7）
     fam_minmax: Dict[str, Tuple[float, float]] = {}
     for f in uniq_fams:
         ss = [s for fam, s in zip(families, sizes) if fam == f and s > 0]
-        if ss:
-            fam_minmax[f] = (min(ss), max(ss))
-        else:
-            fam_minmax[f] = (0.0, 0.0)
+        fam_minmax[f] = (min(ss), max(ss)) if ss else (0.0, 0.0)
 
     colors = []
     for fam, sz in zip(families, sizes):
         base = base_cmap(fam_to_idx[fam] % 10)
         mn, mx = fam_minmax[fam]
         if mn == mx:
-            t = 0.7 if sz == 0 else 1.0  # 沒大小資訊就中等深度；有但都一樣就最深
+            t = 0.7 if sz == 0 else 1.0
         else:
             t = (sz - mn) / (mx - mn)
-        colors.append(shade_color(base, t))
+        colors.append(shade(base, t))
 
-    # 畫圖
-    plt.figure(figsize=(9, 6))
+    # 畫圖（加寬，因為 legend 要放右側）
+    plt.figure(figsize=(11, 6))
     plt.scatter(secs, accs, c=colors, s=160, edgecolor="black", linewidths=0.6)
 
-    # 標註（避免重疊：先用小偏移；你若點很多可再加進階避讓）
+    # 標註模型（用半形字串，避免缺字）
     for x, y, name in zip(secs, accs, models):
         plt.annotate(name, (x, y), xytext=(6, 6), textcoords="offset points")
 
@@ -122,16 +123,31 @@ def main():
     plt.title(args.title)
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
 
-    # Legend：只放 family（顏色不帶深淺，代表色系）
+    # ✅ legend 放右側 + 字體放大，避免擠掉某些 family
     handles = []
     labels = []
     for fam in uniq_fams:
         base = base_cmap(fam_to_idx[fam] % 10)
-        handles.append(plt.Line2D([0], [0], marker="o", color="w",
-                                 markerfacecolor=base, markeredgecolor="black",
-                                 markersize=10))
+        handles.append(
+            plt.Line2D(
+                [0], [0],
+                marker="o", linestyle="",
+                markerfacecolor=base,
+                markeredgecolor="black",
+                markersize=10,
+            )
+        )
         labels.append(fam)
-    plt.legend(handles, labels, title="Model family", loc="best", frameon=True)
+
+    plt.legend(
+        handles, labels,
+        title="Model family",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=True,
+        fontsize=12,
+        title_fontsize=13,
+    )
 
     plt.tight_layout()
     plt.savefig(args.out, dpi=220, bbox_inches="tight")
