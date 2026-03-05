@@ -1,277 +1,114 @@
+# evaluator.py
 from __future__ import annotations
 
 import argparse
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 
-# =========================
-# Config
-# =========================
-FIELDS = ["基準日", "來函機關", "收文編號", "查詢對象"]
+FIELDS = ("基準日", "來函機關", "收文編號", "查詢對象")
 
 
-# =========================
-# Helpers
-# =========================
-def normalize_str(x: Any) -> str:
-    """基本正規化：None -> '', 去頭尾空白、縮空白。"""
-    if x is None:
+def norm(s: Any) -> str:
+    if s is None:
         return ""
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+", " ", str(s).strip())
 
 
-def normalize_key(k: Any) -> str:
-    """用於 case key（檔名）對齊：去頭尾空白、全形空白轉半形。"""
-    s = str(k)
-    s = s.replace("\u3000", " ")  # 全形空白
-    return s.strip()
-
-
-def _extract_json_text(text: str) -> str:
-    i = text.find("{")
-    if i == -1:
-        raise ValueError("找不到 JSON 起點 '{'")
-    return text[i:].strip()
-
-
-def _clean_json_like(s: str) -> str:
-    """
-    容錯清理：
-    - 智慧引號 -> "
-    - 移除 //... 單行註解
-    - 移除 /*...*/ 多行註解
-    - 移除 trailing comma： ,} 或 ,]
-    """
-    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-
-    s = re.sub(r"//.*?$", "", s, flags=re.M)
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
-
-    s = re.sub(r",\s*([}\]])", r"\1", s)
-
-    return s.strip()
-
-
-def _json_error_context(json_text: str, pos: int, window: int = 80) -> str:
-    start = max(0, pos - window)
-    end = min(len(json_text), pos + window)
-    snippet = json_text[start:end]
-    caret = " " * (pos - start) + "^"
-    return snippet.replace("\n", "\\n") + "\n" + caret
-
-
-# =========================
-# Loaders
-# =========================
-def load_answer_json(path: Path) -> Dict[str, Dict[str, Any]]:
-    """
-    答案檔建議是「純 JSON」：
-    {
-      "case_001.txt": {...},
-      ...
-    }
-    若你答案檔也含 meta，你也可以改用 parse_prediction_file 來讀。
-    """
+def load_answer(path: Path) -> Dict[str, Dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError("答案檔 JSON 頂層必須是 dict（key=檔名）")
-
-    # key normalize
-    out: Dict[str, Dict[str, Any]] = {}
-    for k, v in data.items():
-        nk = normalize_key(k)
-        out[nk] = v
-    return out
+        raise ValueError("answer.json 頂層必須是 dict（key=檔名）")
+    return {k.strip(): v for k, v in data.items()}
 
 
-def parse_prediction_file(path: Path) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+def parse_pred(path: Path) -> Tuple[str, str, Dict[str, Dict[str, Any]]]:
     """
-    預測檔格式（你貼的）：
-    \"\"\" 
-      資料：...
-      模型：qwen2.5:3b
-      總執行時間：3分10秒
-    \"\"\"
-    { ...JSON... }
-
-    這裡不靠 regex 硬抓整段 meta，而是逐行掃描，最耐髒。
+    讀取 batch_output_XX.json：
+    - 抽 meta：模型 / 總執行時間
+    - 抽 JSON：從第一個 { 開始 json.loads
     """
     text = path.read_text(encoding="utf-8")
 
-    model: Optional[str] = None
-    time_str: Optional[str] = None
-    time_seconds: Optional[int] = None
+    # 抽模型
+    m = re.search(r"模型：\s*(.+)", text)
+    model = m.group(1).strip() if m else path.stem
 
-    def _norm_spaces(s: str) -> str:
-        return s.replace("\u3000", " ").strip()
+    # 抽時間（3分10秒）
+    t = re.search(r"總執行時間：\s*(\d+)\s*分\s*(\d+)\s*秒", text)
+    time_str = f"{int(t.group(1))}分{int(t.group(2)):02d}秒" if t else "NA"
 
-    for raw_line in text.splitlines():
-        line = _norm_spaces(raw_line)
+    # 抽 JSON 本體
+    i = text.find("{")
+    if i == -1:
+        raise ValueError(f"{path.name} 找不到 JSON 起點 '{{'")
 
-        if model is None and "模型：" in line:
-            model = line.split("模型：", 1)[1].strip()
+    json_text = text[i:].strip()
 
-        if time_str is None and "總執行時間：" in line:
-            tail = line.split("總執行時間：", 1)[1].strip()
-            m = re.search(r"(\d+)\s*分\s*(\d+)\s*秒", tail)
-            if m:
-                minutes = int(m.group(1))
-                seconds = int(m.group(2))
-                time_seconds = minutes * 60 + seconds
-                time_str = f"{minutes}分{seconds:02d}秒"
-            else:
-                # 若格式不符合（例如 190秒 或 00:12），先保留原字串
-                time_str = tail
+    # 若你的 LLM 偶爾輸出智慧引號，這行能救命（不加長度也很值得）
+    json_text = json_text.replace("“", '"').replace("”", '"')
 
-        if model is not None and time_str is not None:
-            break
-
-    json_text_raw = _extract_json_text(text)
-    json_text = _clean_json_like(json_text_raw)
-
-    try:
-        data = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        ctx = _json_error_context(json_text, e.pos)
-        raise ValueError(
-            f"{path.name} JSON解析失敗：{e}\n"
-            f"--- 錯誤附近上下文 ---\n{ctx}\n"
-            f"（常見原因：key 沒雙引號、單引號、trailing comma、註解、智慧引號）"
-        )
-
+    data = json.loads(json_text)
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} JSON 頂層必須是 dict（key=檔名）")
 
-    # key normalize
-    pred: Dict[str, Dict[str, Any]] = {}
-    for k, v in data.items():
-        nk = normalize_key(k)
-        pred[nk] = v
-
-    meta = {
-        "model": model or path.stem,
-        "time_str": time_str or "NA",
-        "time_seconds": time_seconds if time_seconds is not None else -1,
-    }
-    return meta, pred
+    data = {k.strip(): v for k, v in data.items()}
+    return model, time_str, data
 
 
-# =========================
-# Scoring
-# =========================
-@dataclass(frozen=True)
-class ModelReport:
-    file: str
-    model: str
-    time_str: str
-    time_seconds: int
-    total: int
-    strict_correct: int
-    strict_accuracy: float
-    field_accuracy: float
-    per_field_accuracy: Dict[str, float]
-    missing_pred_keys: int
-    extra_pred_keys: int
+def evaluate(answer: Dict[str, Dict[str, Any]], pred: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    akeys = set(answer.keys())
+    pkeys = set(pred.keys())
 
+    missing = len(akeys - pkeys)  # 答案有，預測沒有
+    extra = len(pkeys - akeys)    # 預測有，答案沒有
 
-def evaluate_one_model(
-    gt: Dict[str, Dict[str, Any]],
-    pred: Dict[str, Dict[str, Any]],
-) -> Tuple[int, int, float, float, Dict[str, float], int, int]:
-    gt_keys = set(gt.keys())
-    pred_keys = set(pred.keys())
+    mismatch_fields = 0
+    total_fields = len(akeys) * len(FIELDS)
 
-    missing_pred = len(gt_keys - pred_keys)
-    extra_pred = len(pred_keys - gt_keys)
-
-    keys = sorted(gt_keys)
-    total = len(keys)
-    if total == 0:
-        raise ValueError("答案檔沒有任何 case 可評測")
-
-    strict_correct = 0
-    per_field_hits = {f: 0 for f in FIELDS}
-    total_field_hits = 0
-
-    for k in keys:
-        gt_obj = gt.get(k, {})
-        pred_obj = pred.get(k, {})  # 缺少 case -> 空 dict
-
-        hits = 0
+    for k in akeys:
+        aobj = answer.get(k, {})
+        pobj = pred.get(k, {})  # 缺失就當全部錯
         for f in FIELDS:
-            gt_v = normalize_str(gt_obj.get(f))
-            pred_v = normalize_str(pred_obj.get(f))
-            if gt_v == pred_v:
-                hits += 1
-                per_field_hits[f] += 1
+            if norm(aobj.get(f)) != norm(pobj.get(f)):
+                mismatch_fields += 1
 
-        total_field_hits += hits
-        if hits == len(FIELDS):
-            strict_correct += 1
-
-    strict_acc = strict_correct / total
-    field_acc = total_field_hits / (total * len(FIELDS))
-    per_field_acc = {f: per_field_hits[f] / total for f in FIELDS}
-
-    return total, strict_correct, strict_acc, field_acc, per_field_acc, missing_pred, extra_pred
+    field_acc = 0.0 if total_fields == 0 else (1 - mismatch_fields / total_fields)
+    return {
+        "cases": len(akeys),
+        "total_fields": total_fields,
+        "mismatch_fields": mismatch_fields,
+        "field_accuracy": field_acc,
+        "missing": missing,
+        "extra": extra,
+    }
 
 
-# =========================
-# Main
-# =========================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--answer", required=True, help="答案檔（純 JSON）")
-    parser.add_argument("--pred_dir", required=True, help="預測檔資料夾（多個 .json，允許含 meta + JSON）")
-    parser.add_argument("--out", default="report.json", help="輸出報表檔名")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--answer", required=True)
+    ap.add_argument("--pred_dir", required=True)
+    args = ap.parse_args()
 
-    answer_path = Path(args.answer)
+    answer = load_answer(Path(args.answer))
     pred_dir = Path(args.pred_dir)
-    out_path = Path(args.out)
 
-    gt = load_answer_json(answer_path)
-
-    reports: List[Dict[str, Any]] = []
-
+    rows = []
     for p in sorted(pred_dir.glob("*.json")):
-        meta, pred = parse_prediction_file(p)
+        model, time_str, pred = parse_pred(p)
+        score = evaluate(answer, pred)
+        rows.append((model, time_str, score))
 
-        total, strict_correct, strict_acc, field_acc, per_field_acc, missing_pred, extra_pred = (
-            evaluate_one_model(gt, pred)
-        )
+    # 依 mismatch 少的（越好）排序
+    rows.sort(key=lambda x: x[2]["mismatch_fields"])
 
-        r = ModelReport(
-            file=p.name,
-            model=meta["model"],
-            time_str=meta["time_str"],
-            time_seconds=meta["time_seconds"],
-            total=total,
-            strict_correct=strict_correct,
-            strict_accuracy=round(strict_acc, 6),
-            field_accuracy=round(field_acc, 6),
-            per_field_accuracy={k: round(v, 6) for k, v in per_field_acc.items()},
-            missing_pred_keys=missing_pred,
-            extra_pred_keys=extra_pred,
-        )
-        reports.append(r.__dict__)
-
-    reports.sort(key=lambda x: (x["strict_accuracy"], x["field_accuracy"]), reverse=True)
-
-    out_path.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print(f"Saved: {out_path.resolve()}")
-    for r in reports:
+    for model, time_str, s in rows:
         print(
-            f"{r['model']:<22} | strict={r['strict_accuracy']:.3f} "
-            f"| field={r['field_accuracy']:.3f} | time={r['time_str']} "
-            f"| missing={r['missing_pred_keys']} extra={r['extra_pred_keys']}"
+            f"{model:<18} | mismatch={s['mismatch_fields']}/{s['total_fields']} "
+            f"| acc={s['field_accuracy']:.3f} | time={time_str} "
+            f"| missing={s['missing']} extra={s['extra']}"
         )
 
 
