@@ -34,62 +34,69 @@ def load_answer_json(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def parse_prediction_file(path: Path) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
-    """
-    你的預測檔格式：
-    \"\"\" 
-      資料：...
-      模型：...
-      總執行時間：3分10秒
-    \"\"\"
-    { ... JSON ... }
-
-    我們會：
-    - 用 regex 抽出 模型 / 時間
-    - 找到第一個 '{' 後，把它當 JSON 本體 parse
-    """
     text = path.read_text(encoding="utf-8")
 
-    # 1) 抽 meta
+    # --- meta: 用更穩的方式抓（逐行掃描，容忍空白/縮排/全形空白） ---
     model = None
     time_str = None
     time_seconds = None
 
-    m = META_MODEL_RE.search(text)
-    if m:
-        model = m.group(1).strip()
+    # 把全形空白轉半形，避免你檔案裡縮排被 regex 擋掉
+    def _norm_spaces(s: str) -> str:
+        return s.replace("\u3000", " ").strip()  # \u3000 = 全形空白
 
-    t = META_TIME_RE.search(text)
-    if t:
-        minutes = int(t.group(1))
-        seconds = int(t.group(2))
-        time_seconds = minutes * 60 + seconds
-        time_str = f"{minutes}分{seconds:02d}秒"
+    for raw_line in text.splitlines():
+        line = _norm_spaces(raw_line)
 
-    # 2) 找 JSON 本體起點
+        # 形如：模型：qwen2.5:3b
+        if "模型：" in line and model is None:
+            # 只切第一個 "模型："，避免後面還有冒號
+            model = line.split("模型：", 1)[1].strip()
+
+        # 形如：總執行時間：3分10秒
+        if "總執行時間：" in line and time_str is None:
+            tail = line.split("總執行時間：", 1)[1].strip()
+            # 抓 3分10秒 / 03分10秒 都可
+            m = re.search(r"(\d+)\s*分\s*(\d+)\s*秒", tail)
+            if m:
+                minutes = int(m.group(1))
+                seconds = int(m.group(2))
+                time_seconds = minutes * 60 + seconds
+                time_str = f"{minutes}分{seconds:02d}秒"
+            else:
+                # 有些人會輸出 190秒 或 00:12 之類，你也可在這裡加規則
+                time_str = tail
+
+        if model is not None and time_str is not None:
+            break
+
+    # --- JSON 本體：從第一個 '{' 開始 ---
     json_start = text.find("{")
     if json_start == -1:
-        raise ValueError(f"{path.name} 找不到 JSON 物件起點 '{{'")
+        raise ValueError(f"{path.name} 找不到 JSON 起點 '{{'")
 
-    json_text = text[json_start:].strip()
+    json_text_raw = text[json_start:].strip()
 
-    # 3) parse JSON
+    # 容錯清理：智慧引號/註解/多餘逗號
+    json_text = _clean_json_like(json_text_raw)
+
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
-        # 提供更友善的錯誤訊息
-        preview = json_text[:200].replace("\n", "\\n")
+        ctx = _json_error_context(json_text, e.pos)
         raise ValueError(
-            f"{path.name} JSON 解析失敗：{e}\n"
-            f"JSON 片段預覽(前200字)：{preview}"
+            f"{path.name} JSON解析失敗：{e}\n"
+            f"--- 錯誤附近上下文 ---\n{ctx}"
         )
 
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} JSON 頂層必須是 dict（key=檔名）")
 
     meta = {
-        "model": model or path.stem,
-        "time_str": time_str or "NA",
+        "model": model or path.stem,               # ✅ 現在大概率能抓到模型名
+        "time_str": time_str or "NA",             # ✅ 現在大概率能抓到時間
         "time_seconds": time_seconds if time_seconds is not None else -1,
+        "pred_keys": len(data),                   # ✅ 加這個方便你檢查 missing/extra
     }
     return meta, data
 
