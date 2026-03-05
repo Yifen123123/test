@@ -3,32 +3,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 
+def parse_time_seconds(time_str: str) -> int:
+    m = re.search(r"(\d+)\s*分\s*(\d+)\s*秒", time_str or "")
+    if not m:
+        return 0
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--metrics", required=True, help="evaluator 輸出的 metrics.json")
-    ap.add_argument("--out_dir", default="charts", help="圖表輸出資料夾")
+    ap.add_argument("--metrics", required=True)
+    ap.add_argument("--out_dir", default="charts")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = json.loads(Path(args.metrics).read_text(encoding="utf-8"))
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("metrics.json 應該是 list，且不能為空")
-
-    # 依正確率排序（也可改成依時間或保持原順序）
-    rows.sort(key=lambda r: r["acc"], reverse=True)
+    rows.sort(key=lambda r: r.get("acc", 0.0), reverse=True)
 
     models = [r["model"] for r in rows]
     accs = [r["acc"] for r in rows]
-    secs = [r["time_seconds"] for r in rows]
+    secs = [r.get("time_seconds", parse_time_seconds(r.get("time_str", ""))) for r in rows]
 
-    # 1) Accuracy chart
     plt.figure()
     plt.bar(models, accs)
     plt.xticks(rotation=30, ha="right")
@@ -39,7 +42,6 @@ def main():
     plt.savefig(out_dir / "accuracy.png", dpi=200)
     plt.close()
 
-    # 2) Time chart
     plt.figure()
     plt.bar(models, secs)
     plt.xticks(rotation=30, ha="right")
@@ -49,11 +51,12 @@ def main():
     plt.savefig(out_dir / "time_seconds.png", dpi=200)
     plt.close()
 
-    # 3) Optional: accuracy vs time scatter（看 trade-off）
     plt.figure()
     plt.scatter(secs, accs)
     for r in rows:
-        plt.annotate(r["model"], (r["time_seconds"], r["acc"]))
+        x = r.get("time_seconds", parse_time_seconds(r.get("time_str", "")))
+        y = r["acc"]
+        plt.annotate(r["model"], (x, y))
     plt.xlabel("Time (seconds)")
     plt.ylabel("Accuracy")
     plt.title("Accuracy vs Time")
