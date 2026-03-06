@@ -248,20 +248,24 @@ def plot_acc_diff(comparison: Dict[str, Dict[str, Any]], output_dir: Path) -> No
     plt.close()
 
 
+from adjustText import adjust_text
+
+
 def plot_scatter_tradeoff(comparison, output_dir):
     """
-    畫 time vs acc 散點圖
-    改善：
-    - label 字體變大
-    - label 加 offset
-    - 避免貼在點上
+    time vs accuracy scatter
+    使用 adjustText 自動避免 label 重疊
     """
 
     plt.figure(figsize=(11, 7))
 
+    texts = []
+
     for model, data in comparison.items():
+
         x1 = data["run1_time_sec"]
         y1 = data["run1_acc"]
+
         x2 = data["run2_time_sec"]
         y2 = data["run2_acc"]
 
@@ -272,30 +276,23 @@ def plot_scatter_tradeoff(comparison, output_dir):
         plt.scatter(x1, y1, s=90, marker="o")
         plt.scatter(x2, y2, s=90, marker="^")
 
-        # 畫連線
+        # 畫線
         plt.plot([x1, x2], [y1, y2], linewidth=1)
 
-        # label offset
-        offset_x = (x2 - x1) * 0.05 + 0.02
-        offset_y = (y2 - y1) * 0.05 + 0.002
-
-        # Run1 label
-        plt.text(
-            x1 - offset_x,
-            y1 + offset_y,
-            f"{model} R1",
-            fontsize=10,
-            ha="right"
+        # 先放文字（先不要調整）
+        texts.append(
+            plt.text(x1, y1, f"{model} R1", fontsize=10)
         )
 
-        # Run2 label
-        plt.text(
-            x2 + offset_x,
-            y2 + offset_y,
-            f"{model} R2",
-            fontsize=10,
-            ha="left"
+        texts.append(
+            plt.text(x2, y2, f"{model} R2", fontsize=10)
         )
+
+    # 自動調整 label 位置避免重疊
+    adjust_text(
+        texts,
+        arrowprops=dict(arrowstyle="-", color="gray", lw=0.5)
+    )
 
     plt.xlabel("Time (seconds)", fontsize=12)
     plt.ylabel("Accuracy", fontsize=12)
