@@ -248,14 +248,16 @@ def plot_acc_diff(comparison: Dict[str, Dict[str, Any]], output_dir: Path) -> No
     plt.close()
 
 
-def plot_scatter_tradeoff(comparison: Dict[str, Dict[str, Any]], output_dir: Path) -> None:
+def plot_scatter_tradeoff(comparison, output_dir):
     """
     畫 time vs acc 散點圖
-    同一模型會有兩個點：
-    - Run1: 圓點
-    - Run2: 三角形
+    改善：
+    - label 字體變大
+    - label 加 offset
+    - 避免貼在點上
     """
-    plt.figure(figsize=(10, 7))
+
+    plt.figure(figsize=(11, 7))
 
     for model, data in comparison.items():
         x1 = data["run1_time_sec"]
@@ -266,18 +268,43 @@ def plot_scatter_tradeoff(comparison: Dict[str, Dict[str, Any]], output_dir: Pat
         if any(math.isnan(v) for v in [x1, y1, x2, y2]):
             continue
 
-        plt.scatter(x1, y1, s=80, marker="o")
-        plt.scatter(x2, y2, s=80, marker="^")
+        # 畫點
+        plt.scatter(x1, y1, s=90, marker="o")
+        plt.scatter(x2, y2, s=90, marker="^")
+
+        # 畫連線
         plt.plot([x1, x2], [y1, y2], linewidth=1)
 
-        plt.text(x1, y1, f"{model} (R1)", fontsize=8)
-        plt.text(x2, y2, f"{model} (R2)", fontsize=8)
+        # label offset
+        offset_x = (x2 - x1) * 0.05 + 0.02
+        offset_y = (y2 - y1) * 0.05 + 0.002
 
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Accuracy")
-    plt.title("Prompt Change Trade-off: Time vs Accuracy")
+        # Run1 label
+        plt.text(
+            x1 - offset_x,
+            y1 + offset_y,
+            f"{model} R1",
+            fontsize=10,
+            ha="right"
+        )
+
+        # Run2 label
+        plt.text(
+            x2 + offset_x,
+            y2 + offset_y,
+            f"{model} R2",
+            fontsize=10,
+            ha="left"
+        )
+
+    plt.xlabel("Time (seconds)", fontsize=12)
+    plt.ylabel("Accuracy", fontsize=12)
+    plt.title("Prompt Change Trade-off: Time vs Accuracy", fontsize=14)
+
+    plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(output_dir / "scatter_tradeoff.png", dpi=200)
+
+    plt.savefig(output_dir / "scatter_tradeoff.png", dpi=220)
     plt.close()
 
 
