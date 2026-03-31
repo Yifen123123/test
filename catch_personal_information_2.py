@@ -62,16 +62,19 @@ ID_RE = re.compile(r"[A-Za-z][12]\d{8}")
 # 台灣手機（正常完整格式）
 MOBILE_RE = re.compile(r"09\d{8}")
 
-# 民國日期：
-# 87/10/21
-# 87-10-21
-# 87.10.21
-# 民國87年10月21日
+# 民國日期（STT 版本）
+# 支援：
+# 1. 民國87年2月24
+# 2. 民國87年02月24
+# 3. 87年2月24
+# 4. 870224
 ROC_DATE_RE = re.compile(
-    r"(民國\d{2,3}年\d{1,2}月\d{1,2}日)|(\d{2,3}[\/\-.]\d{1,2}[\/\-.]\d{1,2})"
+    r"(民國\d{2,3}年\d{1,2}月\d{1,2})"
+    r"|(\d{2,3}年\d{1,2}月\d{1,2})"
+    r"|(\d{6})"
 )
 
-# 僅移除這些中文標點與空白，避免破壞 email / 日期格式
+# 僅移除這些中文標點與空白，避免破壞 email
 NORMALIZE_REMOVE_CHARS_RE = re.compile(r"[，。、「」『』【】（）()\[\]\s]+")
 
 
@@ -82,7 +85,7 @@ def normalize_text_for_detection(text: str) -> str:
     """
     用於抽取 R: 內容後的偵測文字：
     - 去除空白與部分中文標點
-    - 保留 @ . / - 這些對 email/date 有意義的符號
+    - 保留 email/date 所需字元
     """
     return NORMALIZE_REMOVE_CHARS_RE.sub("", text)
 
@@ -103,46 +106,73 @@ def normalize_id(s: str) -> str:
 def parse_roc_date(date_str: str) -> Tuple[int, int, int]:
     """
     將民國日期解析成 (roc_year, month, day)
+
     支援：
-    - 87/10/21
-    - 87-10-21
-    - 87.10.21
-    - 民國87年10月21日
+    - 民國87年2月24
+    - 民國87年02月24
+    - 87年2月24
+    - 870224
     """
     s = date_str.strip()
 
-    m = re.fullmatch(r"民國(\d{2,3})年(\d{1,2})月(\d{1,2})日", s)
+    # 民國87年2月24
+    m = re.fullmatch(r"民國(\d{2,3})年(\d{1,2})月(\d{1,2})", s)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-    m = re.fullmatch(r"(\d{2,3})[\/\-.](\d{1,2})[\/\-.](\d{1,2})", s)
+    # 87年2月24
+    m = re.fullmatch(r"(\d{2,3})年(\d{1,2})月(\d{1,2})", s)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+    # 870224
+    m = re.fullmatch(r"(\d{2,3})(\d{2})(\d{2})", s)
+    if m:
+        roc_y = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        return roc_y, month, day
 
     raise ValueError(f"不支援的民國日期格式: {date_str}")
 
 
 def format_fake_birth_like_original(original: str, fake_birth_date: str) -> str:
     """
-    讓 fake 生日盡量跟原始格式一致。
+    讓 fake 生日盡量跟原始格式一致
     """
     roc_y, m, d = parse_roc_date(fake_birth_date)
     original = original.strip()
 
-    if original.startswith("民國") and "年" in original and "月" in original and "日" in original:
-        return f"民國{roc_y}年{m}月{d}日"
+    # 民國87年2月24
+    if original.startswith("民國") and "年" in original and "月" in original:
+        original_m = re.fullmatch(r"民國(\d{2,3})年(\d{1,2})月(\d{1,2})", original)
+        if original_m:
+            orig_month_str = original_m.group(2)
+            orig_day_str = original_m.group(3)
 
-    if "/" in original:
-        return f"{roc_y}/{m}/{d}"
+            month_str = f"{m:02d}" if len(orig_month_str) == 2 else str(m)
+            day_str = f"{d:02d}" if len(orig_day_str) == 2 else str(d)
 
-    if "-" in original:
-        return f"{roc_y}-{m}-{d}"
+            return f"民國{roc_y}年{month_str}月{day_str}"
 
-    if "." in original:
-        return f"{roc_y}.{m}.{d}"
+    # 87年2月24
+    if "年" in original and "月" in original:
+        original_m = re.fullmatch(r"(\d{2,3})年(\d{1,2})月(\d{1,2})", original)
+        if original_m:
+            orig_month_str = original_m.group(2)
+            orig_day_str = original_m.group(3)
+
+            month_str = f"{m:02d}" if len(orig_month_str) == 2 else str(m)
+            day_str = f"{d:02d}" if len(orig_day_str) == 2 else str(d)
+
+            return f"{roc_y}年{month_str}月{day_str}"
+
+    # 870224
+    if re.fullmatch(r"\d{6}", original):
+        return f"{roc_y:02d}{m:02d}{d:02d}"
 
     # fallback
-    return f"{roc_y}/{m}/{d}"
+    return f"民國{roc_y}年{m}月{d}"
 
 
 def load_fake_profiles(csv_path: Path) -> List[FakeProfile]:
@@ -190,7 +220,8 @@ def build_detection_texts(r_lines: List[str]) -> List[str]:
     建立三種偵測文本：
     1. 單行
     2. 相鄰兩行合併
-    3. 全部合併
+    3. 相鄰三行合併
+    4. 全部合併
     """
     texts: List[str] = []
 
@@ -217,7 +248,6 @@ def build_detection_texts(r_lines: List[str]) -> List[str]:
     if all_combined:
         texts.append(all_combined)
 
-    # 由長到短，讓被切分資料更容易先抓到
     texts = sorted(set(texts), key=len, reverse=True)
     return texts
 
@@ -300,9 +330,6 @@ def replace_all_in_text(text: str, replace_map: Dict[str, str]) -> str:
 
 
 def anonymize_one_text(text: str, fake: FakeProfile) -> Tuple[str, ExtractedPII, Dict[str, str]]:
-    """
-    處理單一 txt 內容
-    """
     r_lines = extract_r_lines(text)
     extracted = extract_pii_from_r_texts(r_lines)
     replace_map = build_replace_map(extracted, fake)
@@ -327,7 +354,13 @@ def main() -> None:
         text = txt_path.read_text(encoding="utf-8")
         fake = random.choice(fake_profiles)
 
-        anonymized_text, extracted, replace_map = anonymize_one_text(text, fake)
+        try:
+            anonymized_text, extracted, replace_map = anonymize_one_text(text, fake)
+        except Exception as e:
+            print("=" * 60)
+            print(f"檔案：{txt_path.name}")
+            print(f"處理失敗：{e}")
+            continue
 
         output_path = OUTPUT_DIR / txt_path.name
         output_path.write_text(anonymized_text, encoding="utf-8")
