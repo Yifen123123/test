@@ -81,38 +81,23 @@ def replace_phone_single_line(text: str) -> str:
         text
     )
 
-def resolve_phone_fragments(text: str) -> str:
-    fragment_pattern = re.compile(r'\[PHONE_FRAGMENT:(\d+)\]')
-    lines = text.split("\n")
+def tag_phone_fragment(line: str) -> str:
+    """
+    單行內只有純數字碎片（疑似電話片段）→ 標記為 [PHONE_FRAGMENT]
+    判斷條件：去除 R:/L: 前綴後，內容全為數字（允許空格/連字號），且長度 2~6 碼
+    """
+    prefix_match = re.match(r'^([RLrl]\s*[:：]\s*)(.*)', line)
+    if not prefix_match:
+        return line
 
-    i = 0
-    while i < len(lines):
-        if "[PHONE_FRAGMENT:" not in lines[i]:
-            i += 1
-            continue
+    prefix, content = prefix_match.group(1), prefix_match.group(2).strip()
+    clean = re.sub(r'[\s\-]', '', content)
 
-        group_indices = []
-        accumulated = ""
+    # 純數字 且 長度符合碎片範圍（2~6碼）
+    if re.fullmatch(r'\d{2,6}', clean):
+        return f"{prefix}[PHONE_FRAGMENT:{clean}]"
 
-        j = i
-        while j < len(lines) and "[PHONE_FRAGMENT:" in lines[j]:
-            for m in fragment_pattern.finditer(lines[j]):
-                accumulated += m.group(1)
-            group_indices.append(j)
-            j += 1
-
-        # ✅ 不管長度足不足，一律換成假號碼
-        fake_phone = get_fake("phone")
-        first_prefix = re.match(r'^([RLrl]\s*[:：]\s*)', lines[group_indices[0]])
-        prefix = first_prefix.group(1) if first_prefix else ""
-        lines[group_indices[0]] = f"{prefix}{fake_phone}"
-        for idx in group_indices[1:]:
-            lines[idx] = ""
-
-        i = j
-
-    lines = [l for l in lines if l.strip() != ""]
-    return "\n".join(lines)
+    return line
 
 
 # ============================================================
