@@ -28,26 +28,20 @@ NER_CATEGORY_MAP = {
 }
 
 def replace_by_ner(text: str) -> str:
-    """用 CKIP NER 偵測姓名與地址，替換成假資料"""
     ner = get_ner()
-    # CKIP 接受 list of sentences
     results = ner([text], use_delim=False)
-    entities = results[0]  # [(word, ner_tag), ...]
+    entities = results[0]
 
-    # 由後往前替換，避免位移問題
-    replacements = []
-    for entity, ner_tag in entities:
-        base_tag = ner_tag.split("-")[-1]  # 去除 B-/I- 前綴
-        if base_tag in NER_CATEGORY_MAP:
-            fake_cat = NER_CATEGORY_MAP[base_tag]
-            replacements.append((entity, get_fake(fake_cat)))
-
-    # 去重後替換（同一個詞只換一次）
     seen = set()
-    for original, fake in replacements:
-        if original not in seen:
-            text = text.replace(original, fake)
-            seen.add(original)
+    for entity in entities:
+        word = entity.word
+        ner_tag = entity.ner
+
+        base_tag = ner_tag.split("-")[-1]
+        if base_tag in NER_CATEGORY_MAP and word not in seen:
+            fake_cat = NER_CATEGORY_MAP[base_tag]
+            text = text.replace(word, get_fake(fake_cat))
+            seen.add(word)
 
     return text
 
